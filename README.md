@@ -4,7 +4,7 @@
 
 **把西北工业大学长安校区做成一张可以走进去的像素地图。**
 
-Godot 4 实现 · 桌面 / 手机 / 网页三端 · 支持多人在线同屏与群聊
+Godot 4 实现 · Windows / macOS / Android 三端 · 支持多人在线同屏与群聊
 
 <p>
 <img src="docs/screenshots/day.png" width="32%" alt="白天">
@@ -46,11 +46,99 @@ OpenStreetMap 上长安校区的实测数据，不是手绘示意图 —— 所�
 | 平台 | 文件 | 说明 |
 |---|---|---|
 | Windows | `XGD-Campus-win64.zip` | 解压后双击 `像素工大.exe`，免安装 |
+| macOS | `XGD-Campus-macos.zip` | 通用版（Apple 芯片 + Intel），解压后看包里的「macOS 安装说明.txt」，**第一次要跑一次本地签名命令** |
 | Android | `XGD-Campus-android.zip` | 解压安装 `.apk`，需要允许「安装未知来源应用」 |
 
-最新版本是 [v1.2.0](../../releases/tag/v1.2.0)（2026-10-30），桌面版压缩包里附了「玩法说明.txt」。
+macOS 包没有 Apple 开发者签名，Apple 芯片上未签名的程序会被系统直接拦掉，
+所以解压后先在终端里跑一次（只跑一次）：
+
+```bash
+cd ~/Downloads
+xattr -cr 像素工大.app && codesign --force --deep --sign - 像素工大.app
+```
+
+之后双击就能玩。要正经分发（不弹警告）得用 Apple 开发者账号签名 + 公证，
+这个只能在 Mac 上做。
+
+最新版本是 [v1.2.3](../../releases/tag/v1.2.3)（2026-10-31），压缩包里都附了说明文件。
+
+国内直连 GitHub 很慢（实测 15 KB/s），推荐走镜像：
+`https://ghfast.top/` + 上面的下载链接，实测 9~12 MB/s。
+项目自建的公共下载页（地址见部署文档，不进仓库）上的按钮已经默认指向镜像。
 
 ## 更新日志
+
+### v1.2.3 · 2026-10-31
+
+**只修聊天，协议没动**（服务端不用换，只更新客户端）。
+
+**发完消息输入框不清空** — `_close_input()` 以前只 `release_focus()`，没清 `LineEdit.text`，
+回车发出去之后那行字还留在框里，再按一次回车就把同一句又发一遍。现在 `_send_now()`
+返回是否真的交给了网络，交出去才清空；被本地拦下（禁言 / 刷屏节流）则保留原文。
+
+**同一条消息在别人那边显示两遍** — 客户端发聊天走的是 `post_message.rpc()`，而 Godot 的
+`SceneMultiplayer.server_relay` 默认会把客户端发出的 RPC 自动转发给其他客户端一份；
+服务端代码里 `post_message` 又手动 `_relay_message` 转发了一份过滤后的。两份都到、都显示，
+所以接收端看到两条同文。现在客户端在 `post_message` 里判断「不是服务端、且 sender 不是自己」
+就直接返回 —— 那是自动转发来的原始副本，只认服务端过滤后那份。
+**不能简单把 `server_relay` 关掉**：表情 `broadcast()` → `rpc_id(0)` 靠它转发，一关表情就没了。
+顺带堵了个洞：以前被禁言/被过滤的消息仍会经自动转发抵达别人，现在不会了。
+
+**调试增强** — `[dbg]` 行加 `friends` / `claims` 计数（一眼看出好友表与房间认领有没有同步过来）；
+`XGD_VERIFY_DELAY=<秒>` 可推迟截图；新增 `XGD_TEST_WALK=<秒>` `XGD_TEST_WALK_DIR=` 让角色自己走一段，
+用来核对「我动了，对面那边跟着动」；`XGD_DEBUG` 下聊天会打印 `[chat] live/hist` 与 `[net] relay`。
+
+### v1.2.2 · 2026-10-31
+
+**宿舍门会开合、也会上锁** — 每间房门口那扇门换成了真正的双扇玻璃门：走到跟前
+两扇向两侧滑开（0.4 秒缓动），人过去之后自动合上，门在关闭到 55% 之后才放行碰撞，
+所以不会有「人贴门缝里」的穿模感。门本身参与 y 排序，站在门后会被门挡住。
+
+**只有房主和房主的好友能进自己的房间** — `_room_gate()` 按四种状态判定：
+空房谁都能进、自己的房能进、好友的房能进、别人的房上锁。锁着的时候门上有琥珀色小锁，
+走到门口会被顶住（8Hz 巡检 + 26px 开 / 40px 关的滞回，不会在临界点抖）。门牌颜色
+跟着状态走，远远扫一眼就知道这排房间哪间能进。
+
+**好友系统** — 按 `P` 开面板：待接受的申请可以同意 / 拒绝，好友列表显示在线状态、
+可以删。关系存在服务端（`user://social.json`），重连、换设备都还在。加好友两条路：
+靠近对方按 `E`（优先于认房间），或在面板里发申请。服务端只把「本人那一份切片」
+用 `_sync_social` 下发，别人的好友关系看不见。
+
+**首次启动说明页** — 第一次打开先看一页说明（这是什么、数据怎么用、聊天规则），
+确认后写 `user://consent.cfg`，以后不再弹。它和好友面板共用同一个
+`_refresh_block()`，用来在面板打开时锁住移动。
+
+**聊天内容治理** — `net/chat_guard.gd`：违规词等长打码（只收完整词、不收单字，
+避免误伤「操场」「操作」这类正常词），1.2s 节流，同一句连发三次拦掉。
+
+**注意**：这一版又碰到联机协议（新增好友同步 RPC、房间门状态），
+**客户端和服务端必须都是 v1.2.2**，旧客户端连新服务器会校验失败、进不去。
+公共服务器与三端安装包都已同步更新；Android 的 versionCode
+从 1 升到 2，覆盖安装即可，不用先卸载。
+
+### v1.2.1 · 2026-10-30
+
+**联机时能看见别人了** — 以前进了宿舍就只有自己一个人：进房间只是本地把角色传进去，
+而房间内又完全不发位置包，服务端那份角色还站在宿舍楼门口。现在进出房、换层都会把
+「在房间里 / 第几层 / 落在哪」登记给服务端，房间内每帧把位置和姿势同步出去，
+同层的人在同一个房间里就能互相看见、看见对方走动、坐下和躺床。
+不同楼层、以及还在校园里的人互不可见（房间和校园本来是两个坐标空间）。
+
+**聊天框真同步了** — Godot 的 `rpc()` 从客户端只发到服务器，服务器不会自动转发，
+所以以前只有主机说的话所有人都能看到，客户端发的消息别人那边一片空白。
+现在服务端会把消息逐个转发给其他客户端（不回给自己），三个人以上也能正常群聊。
+
+**注意**：这次改到了联机协议，**服务端和新客户端要一起更新**；旧版客户端连新版服务器
+会提示版本不一致、进不去。公共服务器已同步更新。
+
+**网页版下线** — 服务器不再托管浏览器版（省掉 wasm 与每个网页玩家的连接开销），
+现在根路径会跳到 `/dl/` 下载页。恢复办法写在
+`build/deploy/Caddyfile` 的注释里。
+
+**新增 macOS 版** — 导出的是通用二进制（arm64 + x86_64），Apple 芯片和 Intel 都能跑，
+要求 macOS 11 以上（Intel 10.13 以上）。包内附「macOS 安装说明.txt」：因为这个包没有
+Apple 开发者签名，第一次打开前要在终端跑一次 `xattr -cr` + `codesign --sign -`
+做本地 ad-hoc 签名，否则 Apple 芯片上会被系统直接拦掉。
 
 ### v1.2.0 · 2026-10-30
 
@@ -219,11 +307,25 @@ sudo DOMAIN=game.example.com bash install.sh  # 有域名：自动签 HTTPS 证�
 它会装好 Caddy、建 `/opt/xgd/{server,web}`、注册 systemd 服务并自检。
 装完之后，客户端在设置里把「服务器地址」填成 `ws://你的IP/ws` 就能连。
 
-**3. 网页版**
+**3. 网页版（2026-10-30 起不再提供）**
 
-网页版是单机的（浏览器里没有 UDP，建不了 ENet 主机）。
-如果服务器上同时部署了网页包，浏览器打开地址就能直接玩，
-多人还需要走 `wss://`，细节见 [`build/deploy/README.md`](build/deploy/README.md)。
+网页版已经下线：浏览器里没有 UDP、建不了 ENet 主机，跑起来还要额外扛 wasm +
+每个网页玩家一条 WS，收益不值这些开销。`export_presets.example.cfg` 里的 Web 预设
+和 `build/deploy/Caddyfile` 注释里的 `:443` 段落都留着，将来想恢复照着加回来即可。
+现在服务器只做两件事：`ws://IP/ws`（游戏服务器）和 `/dl/`（下载页，几 KB 的 HTML）。
+
+**安装包不在服务器上**（2026-10-31 起）。三端 zip 由 GitHub Releases 托管，
+这台 100 Mbps 出口只留给 WebSocket —— 之前有人用 `curl` + `Range` 十分钟拉走 7 GB，
+满带宽时在线玩家会跟着卡。发新版本用：
+
+```bash
+python tools/_publish_release.py v1.2.4 preview \
+    build/release/RELEASE_NOTES_v1.2.4.md build/release/XGD-Campus-*.zip
+```
+
+脚本会建 Release、上传资产，并用 GitHub 返回的 `digest` 校验 SHA-256。
+下载页上的「下载」按钮走 `ghfast.top` 镜像（实测 9~12 MB/s），
+「直连」是 GitHub 原始地址（国内很慢但一定能下）。老链接由 Caddy 302 到新源。
 
 > 服务器地址的优先级：`assets/server.local.json`（本机私有，已被 git 忽略）
 > → 环境变量 `XGD_SERVER` → `assets/server.json`（仓库里的空模板）。
@@ -243,7 +345,7 @@ sxgd-game/
 ├── scripts/                   渲染与着色器（楼体 2.5D、窗光、光照图、昼夜）
 ├── addons/godot_ai/           开发期用的编辑器 AI 插件，不影响游戏，可以整个删掉
 ├── tools/                     构建与烘焙脚本（世界场景、房间布局、字体子集、图标、小地图底图）
-└── export_presets.example.cfg  三套导出预设（复制成 export_presets.cfg 再填签名，别提交密钥）
+└── export_presets.example.cfg  四套导出预设（Web / Windows / Linux 服务端 / macOS，复制成 export_presets.cfg 再填签名）
 ```
 
 **改地图** — 编辑 `assets/world.json` 后重新烘焙场景：
@@ -260,7 +362,19 @@ python tools/make_font.py
 
 **导出** — 先把 `export_presets.example.cfg` 复制成 `export_presets.cfg`，填上自己生成的
 Android 签名密钥库路径与密码（这个文件被 git 忽略，不要把密钥提交上来），
-之后 Godot 里 `项目 → 导出` 就有三套预设了。
+之后 Godot 里 `项目 → 导出` 就有四套预设了。命令行导出：
+
+```bash
+godot --headless --path . --export-release "Windows Desktop" "build/windows/像素工大.exe"
+godot --headless --path . --export-release "macOS"           "build/macos/像素工大.zip"
+godot --headless --path . --export-release "Android"         "build/android/像素工大.apk"
+godot --headless --path . --export-release "Linux Server"    "build/server/xgd-server.x86_64"
+godot --headless --path . --export-release "Web"             "build/web/index.html"
+```
+
+macOS 预设的要点写在 `export_presets.example.cfg` 末尾的注释里：通用二进制（arm64 + x86_64）、
+`export_path` 用 `.zip`（`.dmg` 只能在 macOS 上打）、非 Mac 主机上 `codesign/codesign=0`，
+生成的 app 没有签名，macOS 端第一次打开前要 ad-hoc 签一次。
 
 ## 实现上几个关键选择
 

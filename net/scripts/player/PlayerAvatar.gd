@@ -56,6 +56,13 @@ var is_local_player: bool = false
 ## 「人一动不动但位置在椅子周围飘」。
 @export var sit_dir: int = 0
 
+## 是否在宿舍房间里（导出变量，随同步器广播）：房间内的人只和同层的人互相可见，
+## 校园里的人一律不显示房间里的人。以前进房只是本地传送、房间内又完全不发位置包，
+## 服务端那份还停在校园门口 —— 于是「在宿舍里看不见别人，别人也看不见你」。
+@export var room_inside: bool = false
+## 在房间里时的楼层号（1..5）；不在房间就是 0。
+@export var room_floor: int = 0
+
 const HeroDB := preload("res://scripts/sandbox/hero_db.gd")
 ## 下面三个用 preload 而不是全局类名：无头导入时 global_script_class_cache 可能为空
 const PlayerInputScript := preload("res://net/scripts/player/PlayerInput.gd")
@@ -159,6 +166,70 @@ func teleport_to(pos: Vector2) -> void:
 	buffer.entries.clear()
 	correction_offset = Vector2.ZERO
 	_render_lag = Vector2.ZERO
+
+
+## 进 / 出房间、换层时调用：把「我在房间里 + 第几层 + 落在哪」告诉服务端。
+## 服务端是权威，它把这份状态写进自己的 avatar 再广播给所有人：
+##   · 同层的人 -> 显示你，位置继续每 tick 用 _push_room_pose 推过去
+##   · 不同层 / 还在校园的人 -> 隐藏你
+## 以前进房只改了本地坐标，房间内又不发包，别人那边你还站在楼门口。
+func set_room_state(inside: bool, floor_n: int, pos: Vector2) -> void:
+	room_inside = inside
+	room_floor = clampi(floor_n, 1, 99) if inside else 0
+	teleport_to(pos)
+	if Net.is_server():
+		_publish_pose(pos)
+	elif Net.has_session():
+		Net.send_to(1, self, &"_room_state", [room_inside, room_floor, pos])
+
+
+## 客户端 -> 服务端：登记进房 / 出房。坐标是 Objects 局部坐标（房间与 Players 同一空间）。
+@rpc("any_peer", "call_remote", "reliable", 0)
+func _room_state(inside: bool, floor_n: int, pos: Vector2) -> void:
+	if not Net.is_server():
+		return
+	if multiplayer.get_remote_sender_id() != owner_peer_id:
+		return
+	room_inside = inside
+	room_floor = clampi(floor_n, 1, 99) if inside else 0
+	teleport_to(pos)
+	sit_dir = 0
+	# 进/出房这次传送本身也要让远端看到：teleport_to 写的 seq 是 processed_seq
+	# （和上一份校园快照相同值），远端判「seq 没变」会跳过 —— 这里再发布一份新序号。
+	if Net.is_server():
+		_publish_pose(pos)
+
+
+## 房间内的姿态发布序号。校园里 server_state.seq 用 processed_seq（服务端每模拟
+## 一条命令就 +1），房间内服务端不模拟命令、processed_seq 永远不动 —— 远端靠
+## 「seq 变了」才把新位置喂给 RemoteSmoother，序号不动 = 远端永远冻在进房位置，
+## 这就是「校园里同步、宿舍里别人看你不动」的真凶。
+## 用负向递增（-1, -2, …）和校园的正数 seq 永不相撞：出房后 seq 回到
+## processed_seq，值必然不同，远端一定能看到出房传送。
+var _pose_seq: int = 0
+
+
+## 服务端发布一份房间内姿态：序号自增，保证远端每次都当「新快照」收。
+func _publish_pose(pos: Vector2) -> void:
+	_pose_seq -= 1
+	server_position = pos
+	server_state = {"seq": _pose_seq, "position": pos}
+
+
+## 客户端 -> 服务端：房间内每 tick 的位置 / 姿势。
+## 房间内不做服务端模拟（服务端没有房间几何），但位置必须转出去，
+## 否则同房间的人只能看到一个定在门口的木头人。
+@rpc("any_peer", "call_remote", "unreliable_ordered", 3)
+func _push_room_pose(pos: Vector2, dir: int) -> void:
+	if not Net.is_server():
+		return
+	if multiplayer.get_remote_sender_id() != owner_peer_id:
+		return
+	if not room_inside:
+		return                      # 没登记进房就不接受，防止乱传坐标
+	position = pos
+	_publish_pose(pos)
+	sit_dir = clampi(dir, 0, 8)
 
 
 ## 坐到椅子上。pos 是座位点（人物脚底），dir_name 取 down/left/right/up。
@@ -369,6 +440,12 @@ func _on_tick(tick: int) -> void:
 				local_command["x"] = 0.0
 				local_command["y"] = 0.0
 			_apply_movement(local_command)
+			# 位置仍然要给别人看：房间内不跑服务端模拟，但每 tick 把坐标推给服务端，
+			# 服务端写进自己的 avatar 再随同步器广播（同房间的人才看得见你走动）。
+			if Net.is_server():
+				_publish_pose(position)
+			elif Net.has_session():
+				Net.send_to(1, self, &"_push_room_pose", [position, sit_dir])
 		elif buffer.entries.size() < InputBufferScript.CAPACITY:
 			var command: Dictionary = input.sample(self, next_seq, tick)
 			if ui_blocked:                       # 设置面板打开时冻结移动

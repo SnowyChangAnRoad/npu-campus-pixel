@@ -31,6 +31,11 @@ signal emote_received(id: int, index: int)
 ## 联机信息变了（比如 UPnP 探测出结果），设置面板据此刷新「联机地址」那栏
 signal info_changed
 
+const ChatGuard := preload("res://net/chat_guard.gd")
+## 系统提示用的「发言人」。客户端聊天面板见到它就渲染成灰色的系统行，
+## 不去名单里找对应玩家、也不弹头顶气泡。
+const SYS_SPEAKER := "[系统]"
+
 var last_error: String = ""
 var local_name: String = "Player"
 ## 本地选好的角色外观 id（随注册上报，服务器用它决定每个人的贴图）
@@ -57,6 +62,22 @@ var port_mapper: Node
 ## 拿不到就是空串，原因写在 wan_status 里。
 var public_address: String = ""
 var wan_status: String = ""
+
+# ---------------------------------------------------------------- 聊天内容管理
+## 被禁言的 uid。用 uid 而不是昵称：昵称随时能改，uid 才是本机固定的身份。
+var _muted: Dictionary = {}
+## uid -> 上一条消息的 ticks（刷屏节流）
+var _last_msg_ms: Dictionary = {}
+## uid -> 上一条内容 / 连续重复次数（复读机拦截）
+var _last_text: Dictionary = {}
+var _last_text_n: Dictionary = {}
+## 管理员 uid 白名单，来自环境变量 XGD_ADMIN（逗号分隔）
+var _admin_uids: PackedStringArray = []
+## XGD_ADMIN 没配时，第一个连上来的玩家兜底当管理员（小圈子共玩的默认约定）
+var _fallback_admin_uid: String = ""
+## 本地是否已被禁言。服务端下发 @MUTED 后置位，聊天框据此在发送前就拦住，
+## 而不是「先显示成自己发出去了、其实别人收不到」。
+var local_muted: bool = false
 
 
 ## 网页导出、或显式加了 XGD_OFFLINE=1 时走单机（桌面也能用这个变量预演网页行为）
@@ -105,6 +126,7 @@ func _ready() -> void:
 	multiplayer.connection_failed.connect(func(): leave_game("Connection failed. Check the address and UDP port."))
 	multiplayer.server_disconnected.connect(func(): leave_game("The host disconnected. Start a new session from the lobby."))
 	_load_uid()
+	_load_admin()
 	multiplayer.peer_disconnected.connect(_peer_disconnected)
 	port_mapper = preload("res://net/scripts/net/PortMapper.gd").new()
 	add_child(port_mapper)
@@ -325,9 +347,18 @@ func _register(display_name: String, uid: String, hero: String = "adam") -> void
 	if safe_name.is_empty():
 		safe_name = "Player"
 	peers[sender] = {"name": safe_name, "uid": safe_uid, "hero": hero, "ready": false, "floor": 1}
+	# 没配 XGD_ADMIN 时，第一个进来的人自动成为管理员（小圈子共玩不需要额外配置）。
+	if _admin_uids.is_empty() and _fallback_admin_uid.is_empty():
+		_fallback_admin_uid = safe_uid
+		print("[net] 未配置 XGD_ADMIN，%s 作为第一个玩家自动成为管理员" % safe_name)
 	_publish_roster()
 	_send_history_to(sender)          # 新来的人先看到刚才在聊什么
 	_sync_claims.rpc_id(sender, room_claims)   # 以及现有的房间认领公告
+	# 好友切片（谁是他的好友 / 谁在等他接受）—— 房间门禁要靠它判断能不能开门
+	if not _social_loaded:
+		_load_social()
+	_ensure_social(safe_uid, safe_name)
+	_push_social_to(sender)
 
 
 func _publish_roster() -> void:
@@ -417,15 +448,559 @@ func post_message(text: String) -> void:
 	var sender: int = multiplayer.get_remote_sender_id()
 	if sender == 0:
 		sender = my_id()
+	if OS.has_environment("XGD_DEBUG"):
+		print("[net] post_message sender=%d registered=%s text=%s" % [
+			sender, str(peers.has(sender)), text])
 	if not peers.has(sender):
+		return
+	# 客户端上这条 RPC 只可能有两种来源：
+	#   1) 自己发的（call_local，sender == 自己）—— 正常显示；
+	#   2) Godot 的 server_relay 把别人的原始 RPC 自动转过来一份。
+	# 第 2 种没经过违规词 / 禁言 / 刷屏检查，而服务端随后还会用 _relay_message 再发一份
+	# 过滤过的 —— 两份都显示，别人那边就会看到同一条消息刷两遍（线上真的有）。
+	# 这里把自动转发那份丢掉，只认服务端过滤后的 _relay_message。
+	# 注意不能直接把 server_relay 关掉：表情（broadcast → rpc_id(0)）靠它转发。
+	if not is_server() and sender != my_id():
 		return
 	note_received([text])
 	var speaker: String = str(peers[sender]["name"])
 	var clean := text.left(160)
+
+	# 以 / 开头的是管理命令：只交给服务端执行，绝不进公共聊天。
+	# 客户端本地那一趟（call_local）直接返回，指令原文不会出现在自己的聊天框里。
+	# 复用现有 RPC、不新增通道 —— 旧客户端连新服务端不会 checksum failed。
+	if clean.begins_with("/"):
+		if is_server():
+			_handle_command(sender, clean)
+		return
+
+	# 违规词打码。客户端发送前已经过一遍同样的 filter（等长替换，幂等），
+	# 这里再兜一次，防止有人绕开客户端直接 rpc 上来。
+	var safe := ChatGuard.filter(clean)
+	if safe != clean and is_server():
+		_notice_to(sender, "消息里有不当用语，已用 * 代替")
+
 	# 只有服务端落盘（客户端各有一份副本，写多了会互相覆盖）
 	if is_server():
-		_record_chat(speaker, clean)
-	message_received.emit(speaker, clean)
+		if not _accept_message(sender, safe):
+			return          # 被禁言 / 刷屏 / 复读，已经单独回执过了
+		_record_chat(speaker, safe)
+		# 关键：Godot 的 rpc() 从客户端只发到服务器，服务端**不会**自动转发给别人。
+		# 以前少了这一步，客户端发的消息只有它自己和主机看得到 —— 别人那边聊天框
+		# 一片空白（主机自己说的话却正常，因为主机 rpc() 直接发给所有客户端）。
+		if sender != my_id():
+			for id in multiplayer.get_peers():
+				if int(id) != sender:
+					_relay_message.rpc_id(int(id), speaker, safe)
+	message_received.emit(speaker, safe)
+
+
+## 服务端转发别人的聊天。客户端收到后走和本地一样的气泡 + 列表逻辑。
+@rpc("authority", "call_remote", "reliable", 0)
+func _relay_message(speaker: String, text: String) -> void:
+	if OS.has_environment("XGD_DEBUG"):
+		print("[net] relay <- ", speaker, ": ", text, " peer=", my_id())
+	note_received([text])
+	message_received.emit(speaker, text)
+
+
+# ---------------------------------------------------------------- 聊天内容管理
+## 管理员白名单来自环境变量 XGD_ADMIN（服务器上写进 systemd 的 Environment=）。
+## 没配置就由第一个连上来的玩家兜底 —— 校园里自己开房那套本来就没服务器可配。
+func _load_admin() -> void:
+	_admin_uids = PackedStringArray()
+	for part in OS.get_environment("XGD_ADMIN").split(",", false):
+		var u := part.strip_edges()
+		if not u.is_empty():
+			_admin_uids.append(u)
+	if not _admin_uids.is_empty():
+		print("[net] 管理员 uid：", ", ".join(_admin_uids))
+
+
+func _is_admin(uid: String) -> bool:
+	if uid.is_empty():
+		return false
+	if _admin_uids.has(uid):
+		return true
+	if not _admin_uids.is_empty():
+		return false
+	if not _fallback_admin_uid.is_empty():
+		return uid == _fallback_admin_uid
+	# 还没有任何客户端连上来（单机预览 / 自己开房当主机）：主机本人就是管理员。
+	# 不补这条的话，主机在单机模式下用不了任何管理命令 —— _register 只在
+	# 客户端加入时触发，主机自己从不经过它。
+	return is_server() and uid == local_uid
+
+
+## 服务端：这条消息放不放行。不放行时已经给发送者回了提示。
+func _accept_message(sender: int, text: String) -> bool:
+	var uid := str(peers.get(sender, {}).get("uid", ""))
+	if _muted.has(uid):
+		_notice_to(sender, "@MUTED")        # 客户端收到后置 local_muted 并提示
+		return false
+	var now := Time.get_ticks_msec()
+	if ChatGuard.too_fast(int(_last_msg_ms.get(uid, 0)), now):
+		_notice_to(sender, "说慢一点，别刷屏")
+		return false
+	_last_msg_ms[uid] = now
+	if str(_last_text.get(uid, "")) == text:
+		var n := int(_last_text_n.get(uid, 0)) + 1
+		_last_text_n[uid] = n
+		if n >= ChatGuard.REPEAT_LIMIT:
+			_last_text_n[uid] = 1
+			_notice_to(sender, "同一句话别连着发")
+			return false
+	else:
+		_last_text[uid] = text
+		_last_text_n[uid] = 1
+	return true
+
+
+## 服务端：解析 / 开头的管理命令。/help 所有人可用，其余只有管理员。
+func _handle_command(sender: int, raw: String) -> void:
+	var parts := raw.strip_edges().split(" ", false)
+	if parts.is_empty():
+		return
+	var cmd := str(parts[0]).to_lower()
+	var arg := ""
+	if parts.size() > 1:
+		arg = " ".join(PackedStringArray(parts.slice(1))).strip_edges()
+	var uid := str(peers.get(sender, {}).get("uid", ""))
+
+	print("[net] 收到命令 %s（来自 %s / uid %s）" % [
+		cmd, str(peers.get(sender, {}).get("name", "?")), uid])
+
+	if cmd == "/help":
+		_notice_to(sender, "好友：/friends 列表 · /friend 昵称 加好友 · /accept 昵称 · /deny 昵称 · /unfriend 昵称")
+		_notice_to(sender, "管理员：/who 在线名单 · /mute 昵称 · /unmute 昵称 · /clear 清空聊天记录")
+		return
+	# 好友命令人人可用，必须在管理员检查之前分流
+	if FRIEND_CMDS.has(cmd):
+		_handle_friend_command(sender, cmd, arg)
+		return
+	if not _is_admin(uid):
+		_notice_to(sender, "这条命令只有管理员能用。")
+		return
+
+	match cmd:
+		"/who":
+			var lines := PackedStringArray()
+			for id in peers:
+				lines.append("%s(uid %s)" % [
+					str(peers[id].get("name", "?")), str(peers[id].get("uid", "?"))])
+			_notice_to(sender, "在线 %d 人：%s" % [peers.size(), " · ".join(lines)])
+		"/mute":
+			var t1 := _find_peer_by_name(arg)
+			if t1 <= 0:
+				_notice_to(sender, "找不到这个昵称：%s" % arg)
+				return
+			_muted[str(peers[t1].get("uid", ""))] = true
+			_mute_state_to(t1)
+			print("[net] 禁言 %s" % str(peers[t1].get("name", "?")))
+			_broadcast_notice("%s 已被禁言" % str(peers[t1].get("name", "?")))
+		"/unmute":
+			var t2 := _find_peer_by_name(arg)
+			if t2 <= 0:
+				_notice_to(sender, "找不到这个昵称：%s" % arg)
+				return
+			_muted.erase(str(peers[t2].get("uid", "")))
+			_mute_state_to(t2)
+			print("[net] 解除禁言 %s" % str(peers[t2].get("name", "?")))
+			_broadcast_notice("%s 的禁言已解除" % str(peers[t2].get("name", "?")))
+		"/clear":
+			if not _chat_loaded:
+				_load_chat_log()
+			_chat_log.clear()
+			_save_chat_log()
+			print("[net] 聊天记录已清空（操作者 %s）" % str(peers.get(sender, {}).get("name", "?")))
+			_broadcast_notice("@CLEAR")     # 客户端收到后清空自己的聊天面板
+			_broadcast_notice("聊天记录已清空")
+		_:
+			_notice_to(sender, "没有这个命令：%s（/help 查看）" % cmd)
+
+
+func _find_peer_by_name(name: String) -> int:
+	var want := name.strip_edges()
+	if want.is_empty():
+		return 0
+	for id in peers:
+		if str(peers[id].get("name", "")) == want:
+			return int(id)
+	return 0
+
+
+func _mute_state_to(peer: int) -> void:
+	var uid := str(peers.get(peer, {}).get("uid", ""))
+	_notice_to(peer, "@MUTED" if _muted.has(uid) else "@UNMUTED")
+
+
+## 给某个人发一条系统提示。走现有的 _relay_message 通道，不新增 RPC。
+func _notice_to(peer: int, msg: String) -> void:
+	if peer <= 0:
+		return
+	if is_server() and peer == my_id():
+		message_received.emit(SYS_SPEAKER, msg)
+	else:
+		_relay_message.rpc_id(peer, SYS_SPEAKER, msg)
+
+
+## 服务端：给所有人发系统提示（本机玩家自己也要收到一份）
+func _broadcast_notice(msg: String) -> void:
+	if not is_server():
+		return
+	message_received.emit(SYS_SPEAKER, msg)
+	for id in multiplayer.get_peers():
+		_relay_message.rpc_id(int(id), SYS_SPEAKER, msg)
+
+
+# ---------------------------------------------------------------- 好友系统
+## 好友关系是**服务端权威**的社交图，按 uid 存（uid 是本机首次启动随机生成、
+## 落在 user://xgd_uid.cfg 的那个 ID）。不能塞进 peers —— peers 是「这次联机
+## 里在线的人」，人一下线就没了，而好友要跨会话记住，所以单独一张表 + 落盘。
+##
+## 四种状态：
+##   "friend"  双向已成立
+##   "out"     我发出的请求，等对方接受
+##   "in"      对方发出的请求，等我接受
+##   "blocked" 我拉黑了他
+##
+## 客户端只拿「以自己为中心」的切片（my_friends），全量 _social 只存在服务端。
+signal social_changed
+## other_uid -> {"name": String, "state": String}，只含与我相关的条目
+var my_friends: Dictionary = {}
+## 服务端专用的全量图：uid -> {"name": String, "friends": {other_uid: state}}
+var _social: Dictionary = {}
+var _social_loaded := false
+const SOCIAL_PATH := "user://social.json"
+const FRIEND_CMDS := ["/friend", "/accept", "/deny", "/unfriend", "/friends"]
+
+
+## 好友状态查询。门禁判定（宿舍门）就靠它。
+func friend_state(uid: String) -> String:
+	if uid.is_empty():
+		return ""
+	return String((my_friends.get(uid, {}) as Dictionary).get("state", ""))
+
+
+func is_friend(uid: String) -> bool:
+	return friend_state(uid) == "friend"
+
+
+## 待我接受的请求：[{"uid": String, "name": String}]，好友面板渲染用。
+func friend_requests() -> Array:
+	var out: Array = []
+	for u in my_friends:
+		if String((my_friends[u] as Dictionary).get("state", "")) == "in":
+			out.append({
+				"uid": String(u),
+				"name": String((my_friends[u] as Dictionary).get("name", "?")),
+			})
+	out.sort_custom(func(a, b): return String(a["name"]) < String(b["name"]))
+	return out
+
+
+## 已是好友的列表（含离线）：[{"uid", "name"}]。
+func friend_list() -> Array:
+	var out: Array = []
+	for u in my_friends:
+		if String((my_friends[u] as Dictionary).get("state", "")) == "friend":
+			out.append({
+				"uid": String(u),
+				"name": String((my_friends[u] as Dictionary).get("name", "?")),
+			})
+	out.sort_custom(func(a, b): return String(a["name"]) < String(b["name"]))
+	return out
+
+
+## 好友的 uid 集合 —— 门禁判定每帧都要问，别每次都建数组。
+func friend_uids() -> Dictionary:
+	var out: Dictionary = {}
+	for u in my_friends:
+		if String((my_friends[u] as Dictionary).get("state", "")) == "friend":
+			out[String(u)] = true
+	return out
+
+
+# --- 客户端入口：一律走现有的 post_message 命令通道 --------------------------
+## 为什么要绕命令通道而不是新 RPC：RPC 方法一改，旧客户端连新服务端就可能
+## checksum failed，所有人必须同时升级。命令走 post_message、回执走
+## _relay_message，都是老通道，旧客户端最多看不懂那几行提示。
+func friend_request(target_uid: String) -> void:
+	_friend_cmd("/friend", target_uid)
+
+
+func friend_accept(target_uid: String) -> void:
+	_friend_cmd("/accept", target_uid)
+
+
+func friend_deny(target_uid: String) -> void:
+	_friend_cmd("/deny", target_uid)
+
+
+func friend_remove(target_uid: String) -> void:
+	_friend_cmd("/unfriend", target_uid)
+
+
+func friend_refresh() -> void:
+	_friend_cmd("/friends", "")
+
+
+func _friend_cmd(cmd: String, arg: String) -> void:
+	if not has_session():
+		message_received.emit(SYS_SPEAKER, "好友功能要联机才能用（单机模式没有别人）。")
+		return
+	var line := cmd if arg.is_empty() else "%s %s" % [cmd, arg]
+	post_message.rpc(line)
+
+
+# --- 服务端：解析命令 -------------------------------------------------------
+func _handle_friend_command(sender: int, cmd: String, arg: String) -> void:
+	var actor_uid := str(peers.get(sender, {}).get("uid", ""))
+	var actor_name := str(peers.get(sender, {}).get("name", "?"))
+	if actor_uid.is_empty():
+		return
+	if not _social_loaded:
+		_load_social()
+	_ensure_social(actor_uid, actor_name)      # 顺手把昵称刷新到表里
+
+	if cmd == "/friends":
+		_notice_to(sender, _friend_summary(actor_uid))
+		return
+
+	var target := _resolve_uid(arg)
+	if target.is_empty():
+		_notice_to(sender, "找不到这个人：%s（可以输昵称，也可以输 uid）" % arg)
+		return
+	if target == actor_uid:
+		_notice_to(sender, "不能对自己做这个操作。")
+		return
+	_ensure_social(target, "")
+
+	match cmd:
+		"/friend":
+			_notice_to(sender, _friend_request(actor_uid, actor_name, target, sender))
+		"/accept":
+			_notice_to(sender, _friend_accept(actor_uid, target))
+		"/deny":
+			_notice_to(sender, _friend_drop(actor_uid, target, "已拒绝 %s 的好友请求。" % _social_name(target)))
+		"/unfriend":
+			_notice_to(sender, _friend_drop(actor_uid, target, "已和 %s 解除好友关系。" % _social_name(target)))
+
+
+## 返回提示文本；顺手把该推的都推出去。
+func _friend_request(actor_uid: String, actor_name: String, target: String, sender: int) -> String:
+	var a: Dictionary = _social[actor_uid]["friends"]
+	var b: Dictionary = _social[target]["friends"]
+	var st_a := String(a.get(target, ""))
+	var st_b := String(b.get(actor_uid, ""))
+	if st_a == "friend":
+		return "你们已经是好友了。"
+	# 对方也正等着我接受 → 直接成了，省一次来回（两个人都点了「加好友」的场景）
+	if st_b == "in":
+		a[target] = "friend"
+		b[actor_uid] = "friend"
+		_save_social()
+		_push_social_both(actor_uid, target)
+		_notice_to(sender, "你和 %s 成为好友了。" % _social_name(target))
+		_notify_uid(target, "%s 通过了你的好友请求，现在是好友了。" % actor_name)
+		return ""
+	if st_a == "out":
+		return "你已经发过请求了，等 %s 回应。" % _social_name(target)
+	a[target] = "out"
+	b[actor_uid] = "in"
+	_save_social()
+	_push_social_both(actor_uid, target)
+	_notify_uid(target, "@FRIENDREQ|%s|%s" % [actor_uid, actor_name])
+	print("[net] 好友请求 %s -> %s" % [actor_name, _social_name(target)])
+	return "好友请求已发给 %s，等对方接受。" % _social_name(target)
+
+
+func _friend_accept(actor_uid: String, target: String) -> String:
+	var a: Dictionary = _social[actor_uid]["friends"]
+	var b: Dictionary = _social[target]["friends"]
+	if String(a.get(target, "")) != "in":
+		return "%s 没给你发过好友请求。" % _social_name(target)
+	a[target] = "friend"
+	b[actor_uid] = "friend"
+	_save_social()
+	_push_social_both(actor_uid, target)
+	_notify_uid(target, "%s 通过了你的好友请求，现在是好友了。" % _social_name(actor_uid))
+	return "已和 %s 成为好友。" % _social_name(target)
+
+
+## 拒绝请求 / 删除好友：两边条目一起清掉（单向残留会让对方一直挂着「已发送」）。
+func _friend_drop(actor_uid: String, target: String, ok_msg: String) -> String:
+	var a: Dictionary = _social[actor_uid]["friends"]
+	var b: Dictionary = _social[target]["friends"]
+	if not a.has(target) and not b.has(actor_uid):
+		return "你们本来就不是好友。"
+	a.erase(target)
+	b.erase(actor_uid)
+	_save_social()
+	_push_social_both(actor_uid, target)
+	return ok_msg
+
+
+# --- 服务端：社交图维护 -----------------------------------------------------
+func _ensure_social(uid: String, nm: String) -> Dictionary:
+	if uid.is_empty():
+		return {}
+	# 主机（listen server）自己不在 peers 里 —— 它从不经过 _register，
+	# 名字只能从 local_name 补。不补的话，别人看到的房主名是空串。
+	var use := nm
+	if use.is_empty() and uid == local_uid:
+		use = local_name
+	if not _social.has(uid):
+		_social[uid] = {"name": use, "friends": {}}
+	elif not use.is_empty() and String(_social[uid].get("name", "")) != use:
+		_social[uid]["name"] = use    # 改过昵称的人，下次连上来就同步过去
+	return _social[uid]
+
+
+func _social_name(uid: String) -> String:
+	var nm := String((_social.get(uid, {}) as Dictionary).get("name", ""))
+	if not nm.is_empty():
+		return nm
+	if uid == local_uid and is_server():
+		return local_name              # 同上：主机自己在 _social 里可能还没名字
+	# 表里没名字就看看在不在线
+	for id in peers:
+		if str(peers[id].get("uid", "")) == uid:
+			return str(peers[id].get("name", "?"))
+	return uid
+
+
+## 昵称或 uid → uid。先精确 uid，再在线昵称，最后离线好友的昵称。
+func _resolve_uid(arg: String) -> String:
+	var a := arg.strip_edges()
+	if a.is_empty():
+		return ""
+	if _social.has(a):
+		return a
+	for id in peers:
+		if str(peers[id].get("name", "")) == a:
+			return str(peers[id].get("uid", ""))
+	for u in _social:
+		if String((_social[u] as Dictionary).get("name", "")) == a:
+			return String(u)
+	return ""
+
+
+func _friend_summary(uid: String) -> String:
+	var fs: Dictionary = _social.get(uid, {}).get("friends", {})
+	if fs.is_empty():
+		return "还没有好友。走到同学旁边按 E，或在聊天框输入 /friend 昵称。"
+	var ok := PackedStringArray()
+	var wait_in := PackedStringArray()
+	var wait_out := PackedStringArray()
+	for o in fs:
+		var st := String(fs[o])
+		var nm := _social_name(String(o))
+		var online := _uid_online(String(o))
+		match st:
+			"friend":
+				ok.append("%s%s" % [nm, "" if online else "（离线）"])
+			"in":
+				wait_in.append(nm)
+			"out":
+				wait_out.append(nm)
+	var parts := PackedStringArray()
+	parts.append("好友 %d 人：%s" % [ok.size(), "、".join(ok) if ok.size() > 0 else "无"])
+	if wait_in.size() > 0:
+		parts.append("待你接受：%s（/accept 昵称）" % "、".join(wait_in))
+	if wait_out.size() > 0:
+		parts.append("等待对方接受：%s" % "、".join(wait_out))
+	return " · ".join(parts)
+
+
+func _uid_online(uid: String) -> bool:
+	for id in peers:
+		if str(peers[id].get("uid", "")) == uid:
+			return true
+	return false
+
+
+## 给某个 uid 发系统提示（在线才发得出，离线就当没发生 —— 好友请求本身已经
+## 存在表里，他下次上线拉 /friends 就能看到）。
+func _notify_uid(uid: String, msg: String) -> void:
+	for id in peers:
+		if str(peers[id].get("uid", "")) == uid:
+			_notice_to(int(id), msg)
+			return
+
+
+func _push_social_both(a: String, b: String) -> void:
+	_push_social_to_uid(a)
+	_push_social_to_uid(b)
+
+
+func _push_social_to_uid(uid: String) -> void:
+	for id in peers:
+		if str(peers[id].get("uid", "")) == uid:
+			_push_social_to(int(id))
+			return
+
+
+func _push_social_to(peer: int) -> void:
+	if not is_server() or peer <= 0:
+		return
+	var uid := str(peers.get(peer, {}).get("uid", ""))
+	if uid.is_empty():
+		return
+	if peer == my_id():
+		_apply_social(_social_slice(uid))
+	else:
+		_sync_social.rpc_id(peer, _social_slice(uid))
+
+
+## 某人的朋友圈切片：[other_uid: {"name", "state"}]
+func _social_slice(uid: String) -> Dictionary:
+	var out: Dictionary = {}
+	var fs: Dictionary = _social.get(uid, {}).get("friends", {})
+	for o in fs:
+		out[String(o)] = {
+			"name": _social_name(String(o)),
+			"state": String(fs[o]),
+		}
+	return out
+
+
+@rpc("authority", "call_remote", "reliable", 1)
+func _sync_social(snapshot: Dictionary) -> void:
+	_apply_social(snapshot)
+
+
+func _apply_social(snapshot: Dictionary) -> void:
+	my_friends = snapshot.duplicate(true)
+	social_changed.emit()
+
+
+# --- 好友落盘（服务端） -----------------------------------------------------
+func _load_social() -> void:
+	_social_loaded = true
+	if not is_server():
+		return                        # 客户端不落这张表，等 _sync_social 下发
+	if not FileAccess.file_exists(SOCIAL_PATH):
+		return
+	var f := FileAccess.open(SOCIAL_PATH, FileAccess.READ)
+	if f == null:
+		return
+	var parsed = JSON.parse_string(f.get_as_text())
+	f.close()
+	if parsed is Dictionary:
+		_social = parsed
+		print("[net] 好友表已载入：%d 个 uid" % _social.size())
+
+
+func _save_social() -> void:
+	if not is_server():
+		return
+	var f := FileAccess.open(SOCIAL_PATH, FileAccess.WRITE)
+	if f == null:
+		push_warning("[net] 好友表写不进去：%s" % SOCIAL_PATH)
+		return
+	f.store_string(JSON.stringify(_social))
+	f.close()
 
 
 # ---------------------------------------------------------------- 聊天落盘

@@ -28,6 +28,8 @@ const C_OTHER := "#e6eef6"
 const C_SYS := "#8a99a6"
 const C_TIME := "#5f6f7c"
 
+const ChatGuard := preload("res://net/chat_guard.gd")
+
 var _font: Font
 var _panel: Panel                    # 用 Panel 而不是 PanelContainer：容器会被内容撑大，
 var _rule: ColorRect                 # 消息一多就把输入行顶到屏幕外
@@ -49,6 +51,7 @@ var _last_vk := 0                     # 上次读到的软键盘高度，变了�
 var _drag_finger := -1                # 正在拖消息区的手指
 var _drag_y0 := 0.0                   # 按下时的 y（用于按绝对位移算滚动）
 var _drag_scroll0 := 0
+var _last_send_ms := 0                # 本地节流：上一次成功发出的时间
 
 
 func _ready() -> void:
@@ -366,9 +369,34 @@ func _close_input(send: bool) -> void:
 	if OS.has_feature("mobile"):
 		DisplayServer.virtual_keyboard_hide()
 	if send and not text.is_empty():
-		Net.post_message.rpc(text)      # call_local：自己也会立刻收到一条
-		_idle = 0.0
-		_panel.modulate.a = 1.0
+		# 发出去就把输入框清空：以前只 release_focus 不清文本，回车发完后那行字还留在框里，
+		# 再按一次回车就又发一遍，别人那边看到同一条消息刷两遍（自己也会以为发重了）。
+		if _send_now(text):
+			_edit.text = ""
+
+
+## 发送前在本地先过一遍：禁言、刷屏、违规词。
+## 本地拦一道是为了不让「自己看到发出去了、其实别人收不到」——
+## 服务端还会再查一次，因为客户端永远不可信（可以直接 rpc 上来）。
+## 返回 true 表示真的交给网络了（被本地拦下时返回 false，调用方别清空输入框）。
+func _send_now(text: String) -> bool:
+	# 命令（/mute 之类）跳过这些检查，权限由服务端判
+	if not text.begins_with("/"):
+		if Net.local_muted:
+			_append_system("你已被禁言，暂时不能发言")
+			return false
+		var now := Time.get_ticks_msec()
+		if _last_send_ms > 0 and now - _last_send_ms < ChatGuard.MIN_INTERVAL_MS:
+			_append_system("说慢一点，别刷屏")
+			return false
+		_last_send_ms = now
+		if ChatGuard.has_blocked(text):
+			_append_system("消息里有不当用语，已用 * 代替")
+		text = ChatGuard.filter(text)
+	Net.post_message.rpc(text)      # call_local：自己也会立刻收到一条
+	_idle = 0.0
+	_panel.modulate.a = 1.0
+	return true
 
 
 func _on_submitted(text: String) -> void:
@@ -405,6 +433,12 @@ func _set_local_blocked(v: bool) -> void:
 
 # ---------------------------------------------------------------- 收消息
 func _on_message(speaker: String, text: String) -> void:
+	if OS.has_environment("XGD_DEBUG"):
+		print("[chat] live ", speaker, ": ", text)
+	# 系统提示：不弹头顶气泡，也不去玩家名单里找对应的人
+	if speaker == Net.SYS_SPEAKER:
+		_apply_system_cmd(text)
+		return
 	var mine := speaker == str(Net.peers.get(Net.my_id(), {}).get("name", ""))
 	_append(speaker, text, mine, "")
 	for p in get_tree().get_nodes_in_group("players"):
@@ -414,8 +448,39 @@ func _on_message(speaker: String, text: String) -> void:
 			break
 
 
+## 系统下发的内容：@ 开头的是控制指令（不把原文显示出来），其余当普通提示。
+func _apply_system_cmd(text: String) -> void:
+	match text:
+		"@CLEAR":
+			_history.clear()
+			_rebuild_log()
+			_panel.modulate.a = 1.0
+			_idle = 0.0
+		"@MUTED":
+			Net.local_muted = true
+			_append_system("你已被管理员禁言，暂时不能发言")
+		"@UNMUTED":
+			Net.local_muted = false
+			_append_system("禁言已解除，可以正常发言了")
+		_:
+			# 好友请求是控制消息（@FRIENDREQ|uid|昵称），原文不能直接显示，
+			# 换成一句人话；真正接受靠 P 面板或走到对方旁边按 E。
+			if text.begins_with("@FRIENDREQ|"):
+				var parts := text.split("|")
+				var who := String(parts[2]) if parts.size() > 2 else "有人"
+				_append_system("「%s」想加你为好友 · 按 P 打开好友面板" % who)
+				_panel.modulate.a = 1.0          # 让聊天面板亮起来，别错过这条
+				_idle = 0.0
+			elif text.begins_with("@"):
+				pass                             # 认不出来的控制指令：不显示
+			else:
+				_append_system(text)
+
+
 ## 服务端补发的历史消息：只进列表，不弹头顶气泡
 func _on_history(speaker: String, text: String, unix_time: int) -> void:
+	if OS.has_environment("XGD_DEBUG"):
+		print("[chat] hist ", speaker, ": ", text)
 	var mine := speaker == str(Net.peers.get(Net.my_id(), {}).get("name", ""))
 	_append(speaker, text, mine, _fmt_unix(unix_time))
 

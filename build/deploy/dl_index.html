@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>像素工大 · 下载</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 16px 64px;
+    background: #14181f; color: #e6e9ef;
+    font: 15px/1.7 "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  h1 {
+    font-size: 26px; letter-spacing: 2px; margin: 0 0 6px;
+    text-shadow: 3px 3px 0 #0a0d12;
+  }
+  .sub { color: #8c97a8; font-size: 13px; margin-bottom: 28px; }
+  .card {
+    background: #1c222c; border: 2px solid #2b3444; border-radius: 0;
+    padding: 16px 18px; margin-bottom: 14px;
+    box-shadow: 5px 5px 0 #0a0d12;
+  }
+  .row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .name { font-size: 17px; font-weight: 700; min-width: 96px; }
+  .meta { color: #8c97a8; font-size: 13px; flex: 1; min-width: 180px; }
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  a.btn {
+    display: inline-block; padding: 8px 18px; text-decoration: none;
+    color: #14181f; background: #ffb454; font-weight: 700; font-size: 14px;
+    border: 2px solid #b57b2e; box-shadow: 3px 3px 0 #0a0d12;
+    white-space: nowrap;
+  }
+  a.btn:active { transform: translate(2px, 2px); box-shadow: 1px 1px 0 #0a0d12; }
+  a.btn.ghost {
+    background: transparent; color: #ffb454; border-color: #5a4326;
+    box-shadow: none; font-weight: 400; font-size: 13px; padding: 8px 14px;
+  }
+  pre {
+    background: #0e1218; border-left: 3px solid #ffb454; margin: 10px 0 4px;
+    padding: 10px 12px; overflow-x: auto; font-size: 13px;
+    font-family: ui-monospace, Menlo, Consolas, monospace; color: #cfe3ff;
+  }
+  .tip { color: #8c97a8; font-size: 13px; }
+  .tip b { color: #ffd08a; font-weight: 700; }
+  .note {
+    margin-top: 26px; padding-top: 16px; border-top: 1px solid #2b3444;
+    color: #77808f; font-size: 12.5px;
+  }
+  code { color: #ffd08a; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .src {
+    margin-top: 26px; padding-top: 16px; border-top: 1px solid #2b3444;
+    color: #77808f; font-size: 12.5px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>像素工大 · 长安校区</h1>
+  <div class="sub">v1.2.3 · 2026-10-31 · 西北工业大学长安校区像素地图</div>
+
+  <div class="card">
+    <div class="row">
+      <span class="name">Windows</span>
+      <span class="meta">XGD-Campus-win64.zip · 42.1 MB<br>解压后双击「像素工大.exe」，免安装</span>
+      <div class="btns">
+        <a class="btn" href="https://ghfast.top/https://github.com/ctrl36122/npu-campus-pixel/releases/download/v1.2.3/XGD-Campus-win64.zip">下载</a>
+        <a class="btn ghost" href="https://github.com/ctrl36122/npu-campus-pixel/releases/download/v1.2.3/XGD-Campus-win64.zip">直连</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <span class="name">macOS</span>
+      <span class="meta">XGD-Campus-macos.zip · 64.4 MB<br>通用版（Apple 芯片 + Intel），macOS 11+</span>
+      <div class="btns">
+        <a class="btn" href="https://ghfast.top/https://github.com/ctrl36122/npu-campus-pixel/releases/download/v1.2.3/XGD-Campus-macos.zip">下载</a>
+        <a class="btn ghost" href="https://github.com/ctrl36122/npu-campus-pixel/releases/download/v1.2.3/XGD-Campus-macos.zip">直连</a>
+      </div>
+    </div>
+    <div class="tip" style="margin-top:12px">
+      这个包<b>没有 Apple 开发者签名</b>，Apple 芯片上未签名的程序会被系统直接拦掉。
+      解压之后先在「终端」里跑一次（只跑一次），之后双击就能玩：
+    </div>
+    <pre>cd ~/Downloads
+xattr -cr 像素工大.app &amp;&amp; codesign --force --deep --sign - 像素工大.app</pre>
+    <div class="tip">放在别处就把第一行换成对应目录（<code>~/Desktop</code> 或 <code>~/Applications</code>）。包内还有一份「macOS 安装说明.txt」。</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <span class="name">Android</span>
+      <span class="meta">XGD-Campus-android.zip · 32.1 MB<br>解压安装 .apk，需要允许「安装未知来源应用」</span>
+      <div class="btns">
+        <a class="btn" href="https://ghfast.top/https://github.com/ctrl36122/npu-campus-pixel/releases/download/v1.2.3/XGD-Campus-android.zip">下载</a>
+        <a class="btn ghost" href="https://github.com/ctrl36122/npu-campus-pixel/releases/download/v1.2.3/XGD-Campus-android.zip">直连</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <span class="name">网页版</span>
+      <span class="meta">已下线 · 不再提供浏览器版<br>请下载上面的客户端（同一台服务器，联机互通）</span>
+    </div>
+  </div>
+
+  <div class="tip" style="margin-bottom:0">
+    上面的<b>「下载」走加速镜像</b>，国内基本能跑满带宽；如果镜像不通，点旁边的<b>「直连」</b>走 GitHub 原始地址
+    （国内会慢很多，但一定能下）。两个按钮是同一个文件，哈希完全一致。
+  </div>
+
+  <div class="note">
+    所有客户端连同一个公共服务器（地址在客户端按 <code>Tab</code> 可查可改），
+    只有连同一台服务器、并且进同一层同一间宿舍的人才能互相看见。<br>
+    进宿舍楼按 <code>E</code>，认房间 / 写公告板 / 躺床也都是 <code>E</code>，
+    按 <code>P</code> 打开好友面板，<code>T</code> 打开传送面板，<code>Tab</code> 改昵称与服务器地址。<br><br>
+    v1.2.3 修了聊天：以前发完一条消息，输入框里的字不会清掉，再按一次回车就把同一句又发一遍；
+    而且客户端发的话会被转发两次，别人那边看到同一条消息刷两遍。现在发完即清空，每条消息只显示一次。<br>
+    v1.2.2 加了<b>宿舍门禁</b>：每间房的门会滑动开关，只有房主和房主的好友能把门打开，
+    其他人走到门口会被挡住（门口地上会有提示）。想进别人的房间就按 <code>P</code> 申请加好友，
+    对方同意后就能自由进出。<br>
+    这两版都碰到联机协议，<b>客户端和服务端必须都是同一版</b>，旧客户端连新服务器会进不去。
+    服务器已经是最新的，装最新客户端即可。
+  </div>
+
+  <div class="src">
+    <span style="color:#ffd08a;font-weight:700">下载后建议核对 SHA-256</span><br>
+    文件现在托管在 GitHub Releases，走的是 https；但如果你用的是某个第三方镜像，
+    仍建议本地算一次哈希对照，确认下来的就是原始文件。
+    Windows 用 PowerShell：
+    <pre style="font-size:11.5px">Get-FileHash .\XGD-Campus-win64.zip -Algorithm SHA256</pre>
+    macOS / Linux：
+    <pre style="font-size:11.5px">shasum -a 256 XGD-Campus-macos.zip</pre>
+    三个包的正确值（v1.2.3）：
+    <pre style="font-size:11px;white-space:pre-wrap;word-break:break-all">5985ad97ca3079c2a9a2cd7a0322058b5ed3b40a2bac174a6d6af83cbd9d6b3d  XGD-Campus-win64.zip
+932a20321a1071ecc9cf54931f807b67e9e634bedf2728f592e001b3bcd91ca7  XGD-Campus-macos.zip
+d30a5b743604bff88f93efa12294a93315fdaedffdb1b00d82877df4bc92697e  XGD-Campus-android.zip</pre>
+    完整清单（<code>SHA256SUMS.txt</code>）与源码在发布页：
+    <a href="https://github.com/ctrl36122/npu-campus-pixel/releases/tag/v1.2.3" style="color:#ffb454">github.com/ctrl36122/npu-campus-pixel/releases/tag/v1.2.3</a>
+  </div>
+
+</div>
+</body>
+</html>

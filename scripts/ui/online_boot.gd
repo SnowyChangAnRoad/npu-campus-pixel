@@ -18,6 +18,8 @@ const MinimapScript := preload("res://scripts/ui/minimap.gd")
 const WorldMapScript := preload("res://scripts/ui/world_map.gd")
 const ChatScript := preload("res://scripts/ui/chat.gd")
 const TouchPadScript := preload("res://scripts/ui/touch_pad.gd")
+const ConsentScript := preload("res://scripts/ui/consent.gd")
+const FriendPanelScript := preload("res://scripts/ui/friend_panel.gd")
 
 ## 小地图尺寸（保持 424:800 的校园比例）。200 宽在 1080p 下足够看清街区。
 const MINI_W: float = 200.0
@@ -61,6 +63,10 @@ var _base_mini_w: float = MINI_W
 var _map: Control
 var _chat: Node
 var _clock: Label
+## 首次启动的说明页（免责声明 / 隐私 / 聊天规则），点过之后就没了
+var _consent: Node
+## 好友面板（按 P 开合），常驻但不是模态：不开的时候不挡任何东西
+var _friend_panel: Node
 
 
 ## 触屏设备（Android/iOS 包，或 XGD_TOUCH=1 在桌面模拟）
@@ -99,6 +105,8 @@ func _ready() -> void:
 		return
 	_build_ui()
 	_build_chat()
+	_add_consent()
+	_add_friend_panel()
 	# 手机：左下摇杆 + 右下按钮（自己要处理多点触摸，所以是独立 Control）
 	if is_touch_ui():
 		# 必须放独立 CanvasLayer：直接挂在 online_boot 下会落到 layer 0（世界层），
@@ -118,7 +126,12 @@ func _ready() -> void:
 	# 验证用：设了 XGD_VERIFY 时，进世界约 5s 后把主视口存成 res://shot_verify.png，
 	# 即使 AI 插件在 play 启动掉线也能留下画面供人工核对（验证后移除）。
 	if OS.has_environment("XGD_VERIFY"):
-		var vt := get_tree().create_timer(5.0)
+		# 默认 5s 后截图；XGD_VERIFY_DELAY=秒 可以推后（比如等远端发来的聊天刷出来再截）
+		var vd := 5.0
+		var vraw := OS.get_environment("XGD_VERIFY_DELAY").strip_edges()
+		if not vraw.is_empty() and vraw.is_valid_float() and float(vraw) > 0.0:
+			vd = float(vraw)
+		var vt := get_tree().create_timer(vd)
 		vt.timeout.connect(_verify_shot)
 	# 调试用：XGD_CHAT_TAP=1 自动点一下右下「聊」按钮（核对大聊天窗）
 	if OS.has_environment("XGD_CHAT_TAP") and is_instance_valid(_touch_pad):
@@ -144,6 +157,12 @@ func _ready() -> void:
 	if OS.has_environment("XGD_SETTINGS"):
 		var st := get_tree().create_timer(3.0)
 		st.timeout.connect(func(): _toggle_settings(true))
+	# 调试用：XGD_FRIEND_PANEL=1 时自动打开好友面板（配合 XGD_VERIFY 截图核对布局）
+	if OS.has_environment("XGD_FRIEND_PANEL"):
+		var ft := get_tree().create_timer(3.0)
+		ft.timeout.connect(func() -> void:
+			if _friend_panel != null and is_instance_valid(_friend_panel):
+				_friend_panel.call("open"))
 
 
 func _verify_shot() -> void:
@@ -161,6 +180,42 @@ func _build_chat() -> void:
 	_chat = ChatScript.new()
 	_chat.name = "Chat"
 	add_child(_chat)
+
+
+## 首次启动的说明页。先拿一个临时实例问「要不要弹」（它 _ready 里会自己 queue_free），
+## 需要弹才真正挂上去 —— 否则每局游戏都会白建一次全屏遮罩。
+func _add_consent() -> void:
+	var probe: Node = ConsentScript.new()
+	var need: bool = bool(probe.call("should_show"))
+	probe.free()
+	if not need:
+		return
+	_consent = ConsentScript.new()
+	add_child(_consent)
+	_refresh_block()                              # 弹窗期间别让人物跟着 WASD 乱跑
+	_consent.connect("accepted", func() -> void: _refresh_block())
+
+
+## 好友面板随时可以按 P 打开，所以无条件挂上（不像说明页还要先问要不要弹）。
+func _add_friend_panel() -> void:
+	if Net.is_dedicated:
+		return                                    # 专用服务器没有界面
+	_friend_panel = FriendPanelScript.new()
+	_friend_panel.name = "FriendPanel"
+	add_child(_friend_panel)
+	_friend_panel.connect("opened", func() -> void: _refresh_block())
+	_friend_panel.connect("closed", func() -> void: _refresh_block())
+
+
+## 说明页和好友面板都可能是"该挡住移动"的那一个。谁都没开才放开 ——
+## 分别直接写 true/false 的话，关掉面板会把还开着的说明页一起解除。
+func _refresh_block() -> void:
+	var blocked := false
+	if _consent != null and is_instance_valid(_consent) and bool(_consent.call("should_show")):
+		blocked = true
+	if _friend_panel != null and is_instance_valid(_friend_panel) and bool(_friend_panel.call("is_open")):
+		blocked = true
+	_set_local_blocked(blocked)
 
 
 # ---------------------------------------------------------------- 启动流程
@@ -345,6 +400,9 @@ func _on_session_ready() -> void:
 	_hud.visible = true
 	_refresh_roster()
 	_wait_world()
+	# 玩家节点是进世界之后才生成的，_add_consent 那次 block 时它还不存在 ——
+	# 说明页 / 好友面板只要还开着就再挡一次，否则弹窗期间人物会跟着键盘跑。
+	_refresh_block()
 
 
 ## 世界（Arena）是 SessionFlow 在同一个信号里创建的，谁先谁后不确定，
@@ -396,8 +454,9 @@ func _process(delta: float) -> void:
 		avatars += 1
 		names.append("%s@%d,%d%s" % [p.name, int(p.position.x), int(p.position.y),
 			"*" if p.is_local_player else ""])
-	print("[dbg] online=%s id=%d peers=%d avatars=%d phase=%d %s" % [
-		str(_online), Net.my_id(), Net.peer_count(), avatars, GameState.phase, " ".join(names)])
+	print("[dbg] online=%s id=%d peers=%d avatars=%d phase=%d friends=%d claims=%d %s" % [
+		str(_online), Net.my_id(), Net.peer_count(), avatars, GameState.phase,
+		Net.friend_list().size(), Net.room_claims.size(), " ".join(names)])
 
 
 # ---------------------------------------------------------------- 界面
