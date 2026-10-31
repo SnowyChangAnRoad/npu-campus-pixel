@@ -35,6 +35,12 @@ const ZOOM_STEP: float = 1.14
 ## window agrees on who is who.
 const COLORS: Array[Color] = [Color("5b8cff"), Color("ff9f43"), Color("2ed573"), Color("ff6b9d")]
 
+## sit_dir 的 1..4 对应的朝向名（顺序和图集的 *_sit 动画一致）
+const SIT_DIRS: Array[String] = ["down", "left", "right", "up"]
+## 精灵锚点：帧高 48、居中，offset 上移半帧 → 脚底正好落在节点原点。
+## 躺下时改成 (0,0)，让身体绕自己中心转 90°，压在床垫中间。
+const SPRITE_OFFSET := Vector2(0, -24)
+
 var owner_peer_id: int = 0
 var is_local_player: bool = false
 @export var round_id: int = 0
@@ -43,6 +49,12 @@ var is_local_player: bool = false
 @export var server_state: Dictionary = {}
 ## 角色外观 id（adam/ash/lucy/nancy），由服务器按注册时上报的值下发
 @export var hero_id: String = "adam"
+
+## 坐姿：0 = 站着，1..4 = 坐着并面朝 SIT_DIRS 里对应方向。
+## 用整数而不是字符串，是因为要过 MultiplayerSynchronizer 的属性同步。
+## 坐着期间禁止移动（本地预测与服务端模拟走同一个判断），否则会出现
+## 「人一动不动但位置在椅子周围飘」。
+@export var sit_dir: int = 0
 
 const HeroDB := preload("res://scripts/sandbox/hero_db.gd")
 ## 下面三个用 preload 而不是全局类名：无头导入时 global_script_class_cache 可能为空
@@ -80,6 +92,14 @@ var _render_lag: Vector2 = Vector2.ZERO
 var _occluded: bool = false
 ## 当前不透明度，向目标平滑逼近（走过楼边不该「啪」一下变透）
 var _occl_a: float = 1.0
+## 进宿舍空间期间本地权威：服务器不知道你在房间里，临时冻结对自己位置的 reconcile，
+## 否则服务器每帧把人拉回校园，而相机 limit 卡在房间内 → 你被困在房间边界外、看不到自己。
+var _room_freeze := false
+var _stand_req_at := 0.0
+## 连续多少个 tick「按着方向键却一步没挪」才触发脱困（8 × 33ms ≈ 0.27s）。
+## 正常撞墙会被切向滑动救掉，不会走到这一步；只有卡进碰撞体里才需要蹭出去。
+const STUCK_TICKS := 8
+var _stuck_ticks := 0
 
 
 ## 被楼挡住 → 精灵调淡（名牌保持不透明，方便找人）
@@ -141,6 +161,114 @@ func teleport_to(pos: Vector2) -> void:
 	_render_lag = Vector2.ZERO
 
 
+## 坐到椅子上。pos 是座位点（人物脚底），dir_name 取 down/left/right/up。
+## 会先 teleport 吸附过去，再切坐姿动画。
+##
+## ⚠️ 必须同时关掉碰撞体：椅子本身是实心的（world/room 里都有 StaticBody2D），
+## 人一坐到椅子上就和它重叠，物理会把人推开 —— 表现是「刚坐下就被弹到旁边」。
+## 站起来时再打开，走路照样会被椅子挡住。
+func sit_at(pos: Vector2, dir_name: String) -> void:
+	var i := SIT_DIRS.find(dir_name)
+	sit_dir = (i if i >= 0 else 0) + 1
+	if is_local_player:
+		_local_pose = sit_dir
+	teleport_to(pos)
+	_set_collision(false)
+	_apply_sit_anim()
+
+
+## 躺着：sit_dir 5..8 表示躺下（5 + SIT_DIRS 的朝向下标），沿用同一个整型好走属性同步。
+const LIE_BASE := 5
+
+## 本机自己摆的姿势（0 = 没摆）。sit_dir 是要走属性同步的，服务器那份还是 0 时，
+## 每个同步包都会把本地刚坐下的姿势按回去 —— 一按 E 坐下/躺下，下一帧就站起来。
+## 服务器版本比客户端旧、坐/躺这两个 RPC 直接被丢时，就是「椅子和床完全没反应」。
+## 所以本地再存一份，每帧贴回去（见 _hold_local_pose），直到真的起身。
+var _local_pose: int = 0
+
+
+## 每帧把本机自己摆的姿势贴回 sit_dir（同步包改回去就再改回来）
+func _hold_local_pose() -> void:
+	if _local_pose == 0 or not is_local_player:
+		return
+	if sit_dir != _local_pose:
+		sit_dir = _local_pose
+		_apply_sit_anim()
+
+
+func stand_up() -> void:
+	_local_pose = 0
+	if sit_dir == 0:
+		return
+	sit_dir = 0
+	# 躺姿把整个精灵转过来了，起身必须转回去（锚点也要还原，否则人会往上跳半帧）
+	if sprite != null:
+		sprite.rotation = 0.0
+		sprite.offset = SPRITE_OFFSET
+	_set_collision(true)
+	# 躺着时碰撞是关掉的，人正好停在床的碰撞体里面；恢复碰撞后如果直接把
+	# 控制权交回去，人就是「嵌在床里」的状态 —— move_and_collide 从重叠出发
+	# 往哪个方向都推不动，玩家会觉得一起来就卡死、只能重开。
+	# 所以起身时先找一个能站人的空位挪过去。
+	_step_out()
+	_update_visual()
+
+
+## 躺到床上。pos 是床上的落点（人物中心），dir_name 是躺的方向。
+func lay_at(pos: Vector2, dir_name: String) -> void:
+	var i := SIT_DIRS.find(dir_name)
+	sit_dir = LIE_BASE + (i if i >= 0 else 0)
+	if is_local_player:
+		_local_pose = sit_dir
+	teleport_to(pos)
+	_set_collision(false)
+	_apply_sit_anim()
+
+
+## 是否在躺着（含，本地/远端都读这个判断）
+func is_lying() -> bool:
+	return sit_dir >= LIE_BASE
+
+
+## 坐下后按方向键 → 起身。本地立刻生效，同时告诉服务端（座位状态它说了算）。
+## 400ms 节流：起身要等广播回来，期间每一帧都会走到这里，不挡就会刷 RPC。
+func _request_stand() -> void:
+	var now := float(Time.get_ticks_msec())
+	if now - _stand_req_at < 400.0:
+		return
+	_stand_req_at = now
+	stand_up()
+	Net.sit_down(0, Vector2.ZERO)
+
+
+func _set_collision(on: bool) -> void:
+	var cs := get_node_or_null("CollisionShape2D")
+	if cs != null:
+		cs.set_deferred("disabled", not on)
+
+
+## 坐/躺都是单帧静止帧，切换时才 play，免得每帧重置。
+## 躺着时把整个精灵转 90°，锚点挪到身体中心，人就「横」在床垫上；
+## 之前只是把坐姿帧竖着摆在床面上，看着像是站在床上，很怪。
+func _apply_sit_anim() -> void:
+	if sprite == null:
+		return
+	var lying: bool = sit_dir >= LIE_BASE
+	sprite.rotation = -PI * 0.5 if lying else 0.0
+	# 站立/坐姿的锚点在脚下（帧高 48，居中后 offset 上移半帧）；
+	# 躺下时把锚点归零，让身体绕自己中心横过来，正好压在床垫中间。
+	sprite.offset = Vector2.ZERO if lying else SPRITE_OFFSET
+	# 躺下时人整个陷在床的轮廓里，按 y 排序会被床垫整个盖住 ——
+	# 抬一层 z 序，让躺着的人画在家具上面（起身/坐椅子都还原）。
+	if visual != null:
+		visual.z_index = 1 if lying else 0
+	var i: int = sit_dir - LIE_BASE if lying else sit_dir - 1
+	var anim := StringName(SIT_DIRS[clampi(i, 0, SIT_DIRS.size() - 1)] + "_sit")
+	if sprite.animation != anim:
+		sprite.animation = anim
+		sprite.play()
+
+
 ## 按 hero_id 换角色贴图（服务器下发的值变了才重新加载）
 func _apply_hero() -> void:
 	if _applied_hero == hero_id or sprite == null:
@@ -164,6 +292,10 @@ func _update_visual() -> void:
 	_last_pos = position
 	_apply_hero()
 	if sprite == null:
+		return
+	# 坐着时无论输入如何都用坐姿帧
+	if sit_dir != 0:
+		_apply_sit_anim()
 		return
 	var dir_name := "down"
 	if _face_dir != Vector2.ZERO:
@@ -223,7 +355,21 @@ func _on_tick(tick: int) -> void:
 	if GameState.phase != GameState.Phase.IN_RUN:
 		return
 	if is_local_player:
-		if buffer.entries.size() < InputBufferScript.CAPACITY:
+		if _room_freeze:
+			# 房间内是「本地权威」：服务器根本不知道宿舍空间的存在，坐标体系完全不同，
+			# 所以这里既不进预测缓冲也不发包（发包只会让服务器上的人在校园里乱走）。
+			#
+			# 以前的做法是照常 push 进 buffer、只跳过 reconcile —— 但 buffer 只在
+			# reconcile 里确认，等于只进不出：64 条（30Hz 下约 2 秒）塞满之后
+			# `buffer.entries.size() < CAPACITY` 恒为假，连输入都不再采样了。
+			# 人定在原地、_moving 还停在 true，动画一直循环 —— 这就是
+			# 「在宿舍走几步就卡住、却什么都没碰到」的真凶（和碰撞无关）。
+			var local_command: Dictionary = input.sample(self, 0, tick)
+			if ui_blocked:                       # 设置面板打开时冻结移动
+				local_command["x"] = 0.0
+				local_command["y"] = 0.0
+			_apply_movement(local_command)
+		elif buffer.entries.size() < InputBufferScript.CAPACITY:
 			var command: Dictionary = input.sample(self, next_seq, tick)
 			if ui_blocked:                       # 设置面板打开时冻结移动
 				command["x"] = 0.0
@@ -232,13 +378,15 @@ func _on_tick(tick: int) -> void:
 			if not Net.is_server():
 				_apply_movement(command)
 			buffer.push(command, position)
-		if Net.is_server():
-			for command in buffer.pending():
-				_accept_command(owner_peer_id, command)
-		else:
-			# Resend everything unacknowledged: unreliable packets can be lost.
-			Net.send_to(1, self, &"_push_inputs", [buffer.pending()])
-	if Net.is_server():
+		# 房间内不进网络链路：没有要发的命令，也没有要等服务器回的确认
+		if not _room_freeze:
+			if Net.is_server():
+				for command in buffer.pending():
+					_accept_command(owner_peer_id, command)
+			else:
+				# Resend everything unacknowledged: unreliable packets can be lost.
+				Net.send_to(1, self, &"_push_inputs", [buffer.pending()])
+	if Net.is_server() and not _room_freeze:
 		# One command is one fixed movement step. The server grants movement
 		# time (one step per tick, a little banked for jitter), so a client that
 		# floods commands cannot move faster than everyone else.
@@ -300,24 +448,108 @@ func _simulate(command: Dictionary) -> void:
 ## client would be corrected every tick.
 func _apply_movement(command: Dictionary) -> void:
 	var direction: Vector2 = Vector2(float(command.get("x", 0.0)), float(command.get("y", 0.0))).limit_length()
+	# 坐着就不动。本地预测和服务端模拟都走这个函数，一处判断两边一致，
+	# 否则会出现「自己看着没动、别人看着在椅子上蹭」。
+	if sit_dir != 0:
+		# 按方向键 = 想走，那就站起来。不然玩家坐下后按 WASD 毫无反应，
+		# 十个里有九个会以为卡死了。本地先起，手感不用等一个 RTT。
+		if direction.length() > 0.1 and is_local_player:
+			_request_stand()
+		velocity = Vector2.ZERO
+		_moving = false
+		return
 	var speed: float = SPEED
 	if bool(command.get("sprint", false)):
 		speed *= 1.55
 	velocity = direction * speed
 	var before := position
-	move_and_collide(velocity * NetTick.DELTA)
+	# move_and_collide 撞上东西就停、不沿墙滑：宿舍家具密，斜着蹭到床/桌子/门框
+	# 就会直接顶死，玩家按着方向键却一步不动 —— 手感上就是「卡在原地」。
+	# 这里手动做一次切向滑动（用碰撞返回的 remainder 投影到墙面），
+	# 仍然是固定步长的纯数学运算，服务端/客户端各自跑结果一致。
+	var motion: Vector2 = velocity * NetTick.DELTA
+	var hit := move_and_collide(motion)
+	if hit != null:
+		var n: Vector2 = hit.get_normal()
+		var rem: Vector2 = hit.get_remainder()
+		if n.length() > 0.01 and rem.length() > 0.01:
+			var slide: Vector2 = rem.slide(n)
+			if slide.length() > 0.01:
+				move_and_collide(slide)
+	var moved := position - before
 	# 物理位置已经前移，视觉位置留在原处（_render_lag 抵消掉这一步），
 	# 再由 _process 平滑追上去 —— 30Hz 的阶跃就变成了连续移动。
-	_render_lag -= position - before
+	_render_lag -= moved
 	# 视觉方向跟着实际输入走（服务端模拟时同样会更新，保证远端看到的朝向一致）
 	if direction.length() > 0.01:
 		_face_dir = direction.normalized()
-		_moving = true
+		# 撞墙/家具被挡住、实际没挪动 → 不播行走动画，否则会「原地踏步」
+		# （宿舍里家具密，走几步就贴上去、动画却一直循环，看着就像卡死了）。
+		# 仍保持 _face_dir，所以角色会面朝挡住他的那面墙、站定，而不是诡异地空走。
+		_moving = moved.length() > 0.5
+		# 还动不了：如果人其实嵌在家具/墙里（碰撞体互相重叠），
+		# 任何方向的 move_and_collide 都推不动，就会永久定住。攒几个 tick 后挪出去。
+		# 注意必须真查重叠：单纯「顶着墙走不动」是物理上正常的，
+		# 那种情况去推人只会让人在墙边来回抖，比站着不动还难受。
+		if not _moving:
+			if _overlaps():
+				_stuck_ticks += 1
+				if _stuck_ticks >= STUCK_TICKS:
+					_stuck_ticks = 0
+					_step_out()
+			else:
+				_stuck_ticks = 0
+		else:
+			_stuck_ticks = 0
 	else:
 		_moving = false
+		_stuck_ticks = 0
+
+
+## 人物碰撞体是否正和房间/建筑的实体重叠（被挤进家具里了）。
+func _overlaps() -> bool:
+	return not _free_at(global_position)
+
+
+## 把碰撞体整体摆到 world_pos 时是否为空。
+## 用物理空间查询而不是 test_move：人已经嵌在碰撞体里时，
+## test_move 从重叠状态出发永远返回「撞」，判断不出哪边是空地。
+func _free_at(world_pos: Vector2) -> bool:
+	var cs := get_node_or_null("CollisionShape2D") as CollisionShape2D
+	if cs == null or cs.shape == null:
+		return true
+	var off: Vector2 = cs.global_position - global_position
+	var t: Transform2D = cs.global_transform
+	t.origin = world_pos + off
+	var q := PhysicsShapeQueryParameters2D.new()
+	q.shape = cs.shape
+	q.transform = t
+	q.collision_mask = collision_mask
+	q.exclude = [get_rid()]
+	return get_world_2d().direct_space_state.intersect_shape(q, 1).is_empty()
+
+
+## 从碰撞体里挪出来：由近到远环形找第一个能站人的点。
+## 起床（碰撞从关闭恢复）后必须调一次 —— 躺着的位置就在床上，
+## 不挪出来人物会直接卡死在床里，按什么方向都走不动。
+func _step_out() -> bool:
+	if _free_at(global_position):
+		return false                                  # 本来就没嵌进去
+	var dirs: Array[Vector2] = [
+		Vector2.DOWN, Vector2.UP, Vector2.LEFT, Vector2.RIGHT,
+		Vector2(1, 1), Vector2(-1, 1), Vector2(1, -1), Vector2(-1, -1),
+	]
+	for r in [6.0, 12.0, 20.0, 30.0, 44.0, 60.0]:
+		for d in dirs:
+			var p: Vector2 = global_position + (d as Vector2).normalized() * r
+			if _free_at(p):
+				global_position = p
+				return true
+	return false
 
 
 func _process(delta: float) -> void:
+	_hold_local_pose()
 	_update_visual()
 	_update_camera_zoom(delta)
 	if not Net.is_server():
@@ -326,7 +558,10 @@ func _process(delta: float) -> void:
 		if seq != last_seen_seq:
 			last_seen_seq = seq
 			if is_local_player:
-				_reconcile(seq, authoritative)
+				# 进房间期间本地权威：服务器不知道你在宿舍空间里，不能让它把人拉回校园
+				# （否则相机 limit 卡在房间内，你会被卡在房间边界外、屏幕上只剩地板边角）。
+				if not _room_freeze:
+					_reconcile(seq, authoritative)
 			smoother.push(authoritative, Time.get_ticks_msec())
 		if not is_local_player:
 			position = smoother.sample(Time.get_ticks_msec(), position)

@@ -100,8 +100,74 @@ func _process(_d: float) -> bool:
 		print("[滚动] 贴底收消息后 位置 =", chat._scroll.scroll_vertical, " 底部 =", bottom, "（应相等）")
 		if absi(chat._scroll.scroll_vertical - bottom) > 4:
 			fails.append("贴底时新消息没有自动跟随到底部")
+		return false
+
+	# ── 滚轮：在聊天框上滚不能缩放地图 ──
+	if step == 330:
+		var bar: VScrollBar = chat._scroll.get_v_scroll_bar()
+		chat._scroll.scroll_vertical = int(bar.max_value)
+		return false
+
+	if step == 340:
+		_zoom_before = _cam_zoom()
+		_scroll_before = chat._scroll.scroll_vertical
+		_wheel(chat._panel.get_global_rect().get_center(), true)
+		return false
+
+	if step == 360:
+		var moved: int = chat._scroll.scroll_vertical
+		var z := _cam_zoom()
+		print("[滚轮/面板] 滚动位置 %d → %d（应减小），相机视距 %.2f → %.2f（应不变）" % [
+			_scroll_before, moved, _zoom_before, z])
+		if moved >= _scroll_before:
+			fails.append("在聊天框上滚轮没有翻动消息")
+		if absf(z - _zoom_before) > 0.001:
+			fails.append("在聊天框上滚轮把地图缩放了")
+		return false
+
+	# 在面板外面滚，应该照常缩放地图（证明缩放逻辑没被改坏）
+	if step == 380:
+		_zoom_before = _cam_zoom()
+		_wheel(Vector2(root.get_visible_rect().size.x * 0.8, root.get_visible_rect().size.y * 0.8), true)
+		return false
+
+	if step == 400:
+		var z := _cam_zoom()
+		print("[滚轮/世界] 相机视距 %.2f → %.2f（应变小）" % [_zoom_before, z])
+		if absf(z - _zoom_before) < 0.001:
+			fails.append("在面板外滚轮没有缩放地图（缩放逻辑被弄坏了）")
+		return false
+
+	# ── 手指拖动翻历史（手机上的主要方式，不能只靠滚轮）──
+	if step == 420:
+		# 放到中间再拖，两端都没法再动，测不出问题
+		var bar: VScrollBar = chat._scroll.get_v_scroll_bar()
+		chat._scroll.scroll_vertical = int((bar.max_value - bar.page) * 0.5)
+		return false
+
+	if step == 430:
+		_drag_at = chat._scroll.get_global_rect().get_center()
+		_scroll_before = chat._scroll.scroll_vertical
+		_touch_down(_drag_at)
+		return false
+
+	if step == 440:
+		# 手指往下拖 = 翻回更早的消息（就是用户说的「翻不回去」）
+		for i in range(1, 7):
+			_touch_drag(_drag_at + Vector2(0, 22.0 * i), i)
+		return false
+
+	if step == 450:
+		_touch_up(_drag_at + Vector2(0, 132))
+		return false
+
+	if step == 470:
+		var moved: int = chat._scroll.scroll_vertical
+		print("[拖动] 手指下滑 132px 翻回历史：滚动位置 %d → %d（应减小）" % [_scroll_before, moved])
+		if moved >= _scroll_before:
+			fails.append("手指下滑没有翻回更早的聊天记录")
 		if fails.is_empty():
-			print("结果 PASS：点击链路与滚动都正常")
+			print("结果 PASS：点击、滚动、滚轮隔离、手指拖动都正常")
 			quit(0)
 		else:
 			for f in fails:
@@ -110,6 +176,57 @@ func _process(_d: float) -> bool:
 		return true
 
 	return false
+
+
+var _zoom_before := 0.0
+var _scroll_before := 0
+var _drag_at := Vector2.ZERO
+
+
+func _touch_down(pos: Vector2) -> void:
+	var ev := InputEventScreenTouch.new()
+	ev.index = 0
+	ev.position = pos
+	ev.pressed = true
+	root.push_input(ev, true)
+
+
+func _touch_drag(pos: Vector2, i: int) -> void:
+	var ev := InputEventScreenDrag.new()
+	ev.index = 0
+	ev.position = pos
+	ev.relative = Vector2(0, 22)
+	root.push_input(ev, true)
+
+
+func _touch_up(pos: Vector2) -> void:
+	var ev := InputEventScreenTouch.new()
+	ev.index = 0
+	ev.position = pos
+	ev.pressed = false
+	root.push_input(ev, true)
+
+
+func _cam_zoom() -> float:
+	var av := _local_avatar()
+	return float(av.get("_cam_zoom_target")) if av != null else -1.0
+
+
+func _local_avatar() -> Node:
+	for n in root.find_children("*", "CharacterBody2D", true, false):
+		if n.get("is_local_player") == true:
+			return n
+	return null
+
+
+## 注入一次滚轮
+func _wheel(pos: Vector2, up: bool) -> void:
+	var ev := InputEventMouseButton.new()
+	ev.button_index = MOUSE_BUTTON_WHEEL_UP if up else MOUSE_BUTTON_WHEEL_DOWN
+	ev.position = pos
+	ev.global_position = pos
+	ev.pressed = true
+	root.push_input(ev, true)
 
 
 ## 注入一次点按。touch=true 用触摸事件（真机路径），false 用鼠标左键（桌面路径）

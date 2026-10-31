@@ -46,6 +46,9 @@ var _idle := 0.0
 var _history: Array[String] = []      # 每条形如 "[color=#5f7]12:34[/color] [color=..]名字[/color]：正文"
 var _known: Dictionary = {}           # peer_id -> 昵称，用来识别「谁进来了 / 谁走了」
 var _last_vk := 0                     # 上次读到的软键盘高度，变了就重排
+var _drag_finger := -1                # 正在拖消息区的手指
+var _drag_y0 := 0.0                   # 按下时的 y（用于按绝对位移算滚动）
+var _drag_scroll0 := 0
 
 
 func _ready() -> void:
@@ -279,7 +282,6 @@ func _build() -> void:
 	_scroll.mouse_filter = Control.MOUSE_FILTER_STOP      # 手指能在上面拖着翻历史
 	_scroll.resized.connect(_on_scroll_resized)
 	_panel.add_child(_scroll)
-
 	_log = RichTextLabel.new()
 	_log.bbcode_enabled = true
 	_log.fit_content = true                              # 高度由内容决定，不会被容器压扁
@@ -565,6 +567,57 @@ func _fit_scroll() -> void:
 	var use := avail if _expanded else minf(content, avail)
 	_scroll.size = Vector2(maxf(0.0, w - pad * 2.0), maxf(0.0, use))
 	_scroll.position = Vector2(pad, maxf(top, h - bottom - use))
+
+
+## 滚轮与手指拖动都统一在这里拦。
+##
+## 滚轮：之前靠 ScrollContainer 自己消费，但它只在「内容超出可视高度」时才吃；
+## 内容不满一屏、或鼠标落在标题栏/空白处时，事件直接穿到 _unhandled_input，
+## 被 PlayerAvatar 当成镜头缩放 —— 表现就是「聊天框滚不动、地图在动」。
+##
+## 触摸拖动：ScrollContainer 的内置触摸滚动并不可靠（实测桌面模拟触摸时
+## 收到 ScreenDrag 也不动，手机上滚动量也同样存疑），干脆自己算位移，
+## 两个平台行为一致，也方便控制「不越过两端」。
+func _input(event: InputEvent) -> void:
+	if not is_instance_valid(_panel) or not _panel.visible or not is_instance_valid(_scroll):
+		return
+
+	if event is InputEventMouseButton and event.pressed:
+		var step := 0
+		if event.button_index == MOUSE_BUTTON_WHEEL_UP:
+			step = -1
+		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+			step = 1
+		if step == 0:
+			return
+		if not _panel.get_global_rect().has_point(event.position):
+			return                               # 面板之外：放行，照常缩放地图
+		_scroll.scroll_vertical += step * _wheel_step()
+		get_viewport().set_input_as_handled()
+		return
+
+	# 手指按下：只有落在消息区里才算「准备拖动」
+	if event is InputEventScreenTouch:
+
+		if event.pressed:
+			if _scroll.get_global_rect().has_point(event.position):
+				_drag_finger = event.index
+				_drag_y0 = event.position.y
+				_drag_scroll0 = _scroll.scroll_vertical
+		elif event.index == _drag_finger:
+			_drag_finger = -1
+		return
+
+	# 拖动：按绝对位移改滚动量，手指上滑 = 看更早的消息
+	if event is InputEventScreenDrag and event.index == _drag_finger:
+		_scroll.scroll_vertical = _drag_scroll0 - int(event.position.y - _drag_y0)
+		get_viewport().set_input_as_handled()
+
+
+## 一次滚半屏左右，手感接近正经聊天软件（原来交给 ScrollContainer 只有 20px，像没动）
+func _wheel_step() -> int:
+	var page := int(_scroll.get_v_scroll_bar().page)
+	return maxi(56, int(page * 0.5))
 
 
 func _on_scroll_resized() -> void:

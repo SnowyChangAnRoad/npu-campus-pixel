@@ -122,7 +122,7 @@ func host_game(port: int = DEFAULT_PORT, max_players: int = MAX_PLAYERS, use_upn
 		multiplayer.multiplayer_peer = OfflineMultiplayerPeer.new()
 		_offline = true
 		session_id = "%s-%s" % [Time.get_unix_time_from_system(), randi()]
-		peers[1] = {"name": local_name, "uid": local_uid, "hero": local_hero, "ready": false}
+		peers[1] = {"name": local_name, "uid": local_uid, "hero": local_hero, "ready": false, "floor": 1}
 		_registered = true
 		roster_changed.emit()
 		print("[net] 单机会话（web / XGD_OFFLINE）")
@@ -149,7 +149,7 @@ func host_game(port: int = DEFAULT_PORT, max_players: int = MAX_PLAYERS, use_upn
 		_ws = true
 		session_id = "%s-%s" % [Time.get_unix_time_from_system(), randi()]
 		if not is_dedicated:
-			peers[1] = {"name": local_name, "uid": local_uid, "hero": local_hero, "ready": false}
+			peers[1] = {"name": local_name, "uid": local_uid, "hero": local_hero, "ready": false, "floor": 1}
 		_registered = true
 		roster_changed.emit()
 		print("[net] hosting WebSocket :%d（上限 %d 人）" % [_ws_port, max_players])
@@ -166,7 +166,7 @@ func host_game(port: int = DEFAULT_PORT, max_players: int = MAX_PLAYERS, use_upn
 	multiplayer.multiplayer_peer = peer
 	session_id = "%s-%s" % [Time.get_unix_time_from_system(), randi()]
 	if not is_dedicated:
-		peers[1] = {"name": local_name, "uid": local_uid, "hero": local_hero, "ready": false}
+		peers[1] = {"name": local_name, "uid": local_uid, "hero": local_hero, "ready": false, "floor": 1}
 	_registered = true
 	roster_changed.emit()
 	print("[net] hosting UDP %d, authority %d" % [port, my_id()])
@@ -324,9 +324,10 @@ func _register(display_name: String, uid: String, hero: String = "adam") -> void
 	var safe_name: String = display_name.strip_edges().left(24)
 	if safe_name.is_empty():
 		safe_name = "Player"
-	peers[sender] = {"name": safe_name, "uid": safe_uid, "hero": hero, "ready": false}
+	peers[sender] = {"name": safe_name, "uid": safe_uid, "hero": hero, "ready": false, "floor": 1}
 	_publish_roster()
 	_send_history_to(sender)          # 新来的人先看到刚才在聊什么
+	_sync_claims.rpc_id(sender, room_claims)   # 以及现有的房间认领公告
 
 
 func _publish_roster() -> void:
@@ -505,6 +506,317 @@ func _show_emote(index: int) -> void:
 	var sender: int = multiplayer.get_remote_sender_id()
 	if peers.has(sender):
 		emote_received.emit(sender, clampi(index, 0, 3))
+
+
+# --- 坐椅子 ---------------------------------------------------------------
+
+## id, 坐姿方向（0 = 站起来），座位世界坐标
+signal seat_changed(id: int, dir: int, pos: Vector2)
+
+## 上次坐下/起身的时间戳（秒），兼作防刷：0.25s 内只认一次
+var _seat_gate: Dictionary = {}
+
+
+## 坐下 / 起身。dir：1..4 = 坐下（面朝 down/left/right/up），5..8 = 躺下，0 = 起身。
+##
+## 客户端**先在本地生效**再发请求：座位只是自己的姿势，位置也已经由自己算好。
+## 以前客户端纯等服务端回包，而服务端的 _request_seat 只改了它自己那份、
+## 根本没广播 —— 结果客户端按 E 完全没反应（椅子坐不下、床躺不下）。
+func sit_down(dir: int, pos: Vector2) -> void:
+	var d: int = clampi(dir, 0, 8)
+	if not has_session():
+		seat_changed.emit(my_id(), d, pos)          # 单机：自己说了算
+		return
+	if is_server():
+		_apply_seat(1, d, pos)
+		broadcast(self, &"_show_seat", [1, d, pos])
+		return
+	seat_changed.emit(my_id(), d, pos)              # 本地先落地（界面立刻响应）
+	_request_seat.rpc_id(1, d, pos)                 # 再请服务端裁定并广播给别人
+
+
+@rpc("any_peer", "call_remote", "reliable", 0)
+func _request_seat(dir: int, pos: Vector2) -> void:
+	if not is_server():
+		return
+	var id: int = multiplayer.get_remote_sender_id()
+	# 这里以前 clamp 到 0..4，5..8 的躺姿被削成「面朝上的坐姿」—— 床等于废了
+	var d: int = clampi(dir, 0, 8)
+	_apply_seat(id, d, pos)
+	# 转发给所有人（含发起者）：以前这里不广播，别人看不到你坐下，
+	# 你自己也收不到任何确认，表现就是「按 E 没反应」。
+	broadcast(self, &"_show_seat", [id, d, pos])
+
+
+## 服务端：改这个玩家的座位状态并推给所有人
+func _apply_seat(id: int, dir: int, pos: Vector2) -> void:
+	if not peers.has(id):
+		return
+	var now := float(Time.get_ticks_msec()) / 1000.0
+	if now - float(_seat_gate.get(id, -9.0)) < 0.25:
+		return
+	_seat_gate[id] = now
+	seat_changed.emit(id, dir, pos)
+
+
+## 收到某人的姿势变化。参数兼容两种形状，方便新旧服务端混跑：
+##   新：(玩家 id, 姿势, 坐标)   旧：(姿势, 坐标)，只可能是服务端自己
+@rpc("any_peer", "call_remote", "reliable", 0)
+func _show_seat(a: Variant, b: Variant, c: Variant = null) -> void:
+	var id := 1
+	var dir := 0
+	var pos := Vector2.ZERO
+	if c == null:
+		dir = int(a)
+		pos = Vector2(b)
+	else:
+		id = int(a)
+		dir = int(b)
+		pos = Vector2(c)
+	if not peers.has(id):
+		return
+	seat_changed.emit(id, clampi(dir, 0, 8), pos)
+
+
+# --- 楼层 ---------------------------------------------------------------
+## 每层宿舍布局完全相同，所以「换层」不搬几何，只改每个玩家所在的楼层号。
+## 楼层号挂在 roster 里（peers[id]["floor"]）随名单一起同步：同层的人才互相可见，
+## 异层的人互相隐藏 —— 既省内存（只实例化一份房间），联机也不会穿帮。
+## 本机自己的楼层变化用 set_my_floor() 请求，服务端裁定后广播。
+func set_my_floor(n: int) -> void:
+	var f: int = clampi(n, 1, 99)
+	if is_server():
+		_apply_floor(1, f)
+	elif has_session():
+		_request_floor.rpc_id(1, f)
+
+
+@rpc("any_peer", "call_remote", "reliable", 0)
+func _request_floor(n: int) -> void:
+	if is_server():
+		_apply_floor(multiplayer.get_remote_sender_id(), n)
+
+
+func _apply_floor(id: int, n: int) -> void:
+	if not is_server() or not peers.has(id):
+		return
+	peers[id]["floor"] = clampi(n, 1, 99)
+	_publish_roster()
+
+
+## 某个玩家现在在第几层（1 起）。没登记就按 1 层。
+func floor_of(id: int) -> int:
+	return int(peers.get(id, {}).get("floor", 1))
+
+
+# --- 房间认领公告 -------------------------------------------------------
+## "floor:room" -> {"name": String, "uid": String, "note": String}。
+## 服务端权威，客户端只发请求；note 是房主写的门口公告（自我介绍），可缺省。
+signal room_claims_changed
+var room_claims: Dictionary = {}
+## 本机自己那间房的本地镜像（含公告正文）：{"floor", "index", "name", "note"}。
+## 用途是「退出重进还在」——服务端只把认领存在内存里，重启就没了；旧版服务端
+## 更是直接丢掉认领请求。本地存一份，进游戏先贴回去，服务端认下来之后以它为准。
+var my_room_cache: Dictionary = {}
+## 刚主动退掉的房间 "楼层:房号"。服务器快照里可能还留着它（旧版服务端不认退房请求），
+## 记下来别再把那间当成「我的房间」，否则退房后又会被存档写回去。
+var void_claim: String = ""
+
+
+## 认领 / 取消某间房（name 为空 = 取消）。
+## **客户端也先本地落地**：等服务端回包才改界面，一旦对面是旧版服务端（这个 RPC
+## 它不认识，包直接被丢掉），就会变成「提示说认领成功、牌子上还是空房」。
+## 先写本地再发请求，界面永远和操作一致；服务端随后广播的全量快照会覆盖它。
+func claim_room(floor_n: int, room_idx: int, display_name: String) -> void:
+	var nm: String = display_name.strip_edges().left(24)
+	if not has_session():
+		_write_claim(local_uid, floor_n, room_idx, nm)
+		return
+	if is_server():
+		_write_claim(local_uid, floor_n, room_idx, nm)
+		_sync_claims.rpc(room_claims)
+		return
+	_write_claim(local_uid, floor_n, room_idx, nm)
+	_request_claim.rpc_id(1, floor_n, room_idx, nm)
+
+
+@rpc("any_peer", "call_remote", "reliable", 0)
+func _request_claim(n: int, r: int, nm: String) -> void:
+	if not is_server():
+		return
+	_apply_claim(multiplayer.get_remote_sender_id(), n, r, nm.strip_edges().left(24))
+	_sync_claims.rpc(room_claims)
+
+
+## 服务端：写入认领。**一个人同时只能有一间**：认领新房间会自动退掉他之前的房间。
+## 已被别人的 uid 认领的房不抢；name 为空则取消。
+func _apply_claim(peer_id: int, n: int, r: int, nm: String) -> void:
+	var uid := local_uid if peer_id <= 1 else str(peers.get(peer_id, {}).get("uid", ""))
+	_write_claim(uid, n, r, nm)
+
+
+## 真正改 room_claims 的地方（服务端裁定和客户端本地预写共用一套规则）。
+## 返回 true 表示这次改动确实生效了 —— 调用方据此判断「是不是真认领到」，
+## 而不是靠“我发过请求了”就报成功。
+func _write_claim(uid: String, n: int, r: int, nm: String) -> bool:
+	if n < 1 or r < 0 or uid.is_empty():
+		return false
+	var key := "%d:%d" % [n, r]
+	var cur: Dictionary = room_claims.get(key, {})
+	if not cur.is_empty() and String(cur.get("uid", "")) != uid:
+		return false                   # 是别人的房间，不允许覆盖
+	if nm.is_empty():
+		if cur.is_empty():
+			return false
+		room_claims.erase(key)
+		if uid == local_uid:
+			my_room_cache = {}
+			void_claim = key              # 别让服务器的旧快照把它当成我的房
+	else:
+		# 退掉同一 uid 名下的其它房间（「每个人只能同时占有一个房间」）
+		for k in room_claims.keys():
+			if String(k) == key:
+				continue
+			if String(Dictionary(room_claims[k]).get("uid", "")) == uid:
+				room_claims.erase(k)
+		room_claims[key] = {"name": nm, "uid": uid}
+		if uid == local_uid:
+			# 记进本地镜像（公告正文跟着走），退出重进还能贴回来
+			my_room_cache = {
+				"floor": n, "index": r, "name": nm,
+				"note": String(my_room_cache.get("note", "")),
+			}
+			void_claim = ""
+	room_claims_changed.emit()
+	return true
+
+
+## 某个 uid 现在认领的是哪间房，返回 "楼层:房号"；没有就返回 ""。
+func claim_of_uid(uid: String) -> String:
+	if uid.is_empty():
+		return ""
+	for k in room_claims.keys():
+		if String(Dictionary(room_claims[k]).get("uid", "")) == uid:
+			return String(k)
+	return ""
+
+
+## 本机认领的房间 "楼层:房号"（没认领则空），用来决定「这次从哪儿出生」。
+## 本地镜像里那间优先：旧版服务端不认认领请求，它的快照里可能还留着我以前的房间，
+## 按插入顺序取第一个匹配 uid 的 key 会取到旧房 —— 存档和出生点就退回上一间了。
+func my_claim() -> String:
+	if not my_room_cache.is_empty():
+		var k := "%d:%d" % [int(my_room_cache.get("floor", 0)), int(my_room_cache.get("index", -1))]
+		if String(Dictionary(room_claims.get(k, {})).get("uid", "")) == local_uid:
+			return k
+	if not void_claim.is_empty():
+		if String(Dictionary(room_claims.get(void_claim, {})).get("uid", "")) == local_uid:
+			return ""            # 我刚退掉、服务器还没清掉：就当没认领
+		void_claim = ""          # 服务器那边已经没了，标记作废
+	return claim_of_uid(local_uid)
+
+
+@rpc("authority", "call_remote", "reliable", 0)
+func _sync_claims(snapshot: Dictionary) -> void:
+	room_claims = snapshot.duplicate(true)
+	_restore_cached_claim()
+	room_claims_changed.emit()
+
+
+## 用本地镜像兜底：服务端快照里没有「我的房间」时把它补回去。
+## 旧版服务端根本不认认领请求，每收到一次快照就会把本地刚贴的公告冲掉 ——
+## 补回来之后，牌子/公告正文至少在本机是对的。房间被别人占了则以服务端为准。
+func _restore_cached_claim() -> void:
+	# 主动退掉的房不该再从服务器旧快照里冒出来（门牌上会挂着我的名字）
+	if not void_claim.is_empty() and String(Dictionary(room_claims.get(void_claim, {})).get("uid", "")) == local_uid:
+		room_claims.erase(void_claim)
+	if my_room_cache.is_empty() or local_uid.is_empty():
+		return
+	var key := "%d:%d" % [int(my_room_cache.get("floor", 0)), int(my_room_cache.get("index", -1))]
+	var cur: Dictionary = room_claims.get(key, {})
+	var owner := String(cur.get("uid", ""))
+	if not owner.is_empty() and owner != local_uid:
+		my_room_cache = {}                 # 被别人占了：本地这份作废
+		return
+	if cur.is_empty():
+		room_claims[key] = {"name": String(my_room_cache.get("name", local_name)), "uid": local_uid}
+	var note := String(my_room_cache.get("note", ""))
+	if not note.is_empty():
+		room_claims[key]["note"] = note
+	# 一人一间：服务器的旧快照里可能还留着我以前占的房间（旧版服务端不认新请求），
+	# 不清掉的话门牌上会同时挂着我两个名字，my_claim 也可能取到旧的那间。
+	for k in room_claims.keys():
+		if String(k) == key:
+			continue
+		if String(Dictionary(room_claims[k]).get("uid", "")) == local_uid:
+			room_claims.erase(k)
+
+
+## 启动时把本地存档里那间房灌进 Net（还没连上服务器也能显示自己的牌子/公告）
+## ⚠️ 只在内容真的变了才走一遍恢复+广播：调用链是
+## _save_my_room → set_cached_room → room_claims_changed → _refresh_door_plates
+## → _remember_my_home → _save_my_room …，不挡住就是无限递归（踩过栈溢出）。
+func set_cached_room(floor_n: int, idx: int, name: String, note: String) -> void:
+	if floor_n < 1 or idx < 0:
+		return
+	var clean := _clean_note(note)
+	var same: bool = int(my_room_cache.get("floor", 0)) == floor_n \
+		and int(my_room_cache.get("index", -1)) == idx \
+		and String(my_room_cache.get("note", "")) == clean
+	my_room_cache = {"floor": floor_n, "index": idx, "name": name, "note": clean}
+	if same:
+		return
+	_restore_cached_claim()
+	room_claims_changed.emit()
+
+
+## 房主改写自家门口的公告（自我介绍）。只有认领人本人能写；空串 = 擦掉。
+## 公告跟着认领走：撕下公告（取消认领）时整条记录一并消失。
+func set_room_note(room_idx: int, note: String) -> void:
+	var txt: String = _clean_note(note)
+	if not has_session():
+		_apply_note(local_uid, room_idx, txt)
+		return
+	if is_server():
+		_apply_note(local_uid, room_idx, txt)
+		_sync_claims.rpc(room_claims)
+		return
+	# 客户端同样先本地写，理由和 claim_room 一样（旧服务端会把请求丢掉）
+	_apply_note(local_uid, room_idx, txt)
+	_request_note.rpc_id(1, room_idx, txt)
+
+
+@rpc("any_peer", "call_remote", "reliable", 0)
+func _request_note(r: int, note: String) -> void:
+	if not is_server():
+		return
+	var uid := str(peers.get(multiplayer.get_remote_sender_id(), {}).get("uid", ""))
+	_apply_note(uid, r, _clean_note(note))
+	_sync_claims.rpc(room_claims)
+
+
+## 公告正文清洗：多行保留换行（面板里本来就按多行展示），去掉首尾空白，
+## 长度上限 160 字 —— 一间宿舍的门板写得下一小段自我介绍就够。
+func _clean_note(note: String) -> String:
+	return note.replace("\r", "").replace("\u0000", "").strip_edges().left(160)
+
+
+## 服务端：把 note 写进该 uid 名下那间房的认领记录。没认领过房间的写不进去。
+func _apply_note(uid: String, r: int, note: String) -> void:
+	if uid.is_empty() or r < 0:
+		return
+	var key := claim_of_uid(uid)
+	if key.is_empty():
+		return
+	var cur: Dictionary = room_claims[key]
+	if note.is_empty():
+		cur.erase("note")
+	else:
+		cur["note"] = note
+	room_claims[key] = cur
+	if uid == local_uid and not my_room_cache.is_empty():
+		my_room_cache["note"] = note        # 本地镜像同步更新，退出重进还能读回来
+	room_claims_changed.emit()
 
 
 # --- Ready-up lobby -------------------------------------------------------
